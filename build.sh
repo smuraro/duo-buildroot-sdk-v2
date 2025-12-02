@@ -1,6 +1,11 @@
 #!/bin/bash
 
 TOP_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+
+EXTERNAL=${TOP_DIR}/external
+export BR2_EXTERNAL="$EXTERNAL/br2-external"
+source $EXTERNAL/buildroot_replace.sh || exit 1
+
 cd ${TOP_DIR}
 
 function show_info()
