@@ -159,4 +159,6 @@ cp $TOOLCHAIN_RISCV64_MUSL $TPU_SDK_INSTALL_PATH/cmake
 # copy lib
 mkdir -p "$SYSTEM_OUT_DIR"/lib/
 cp -a "$TPU_SDK_INSTALL_PATH"/lib/*.so* "$SYSTEM_OUT_DIR"/lib/
+# exclude libuv.so*
+rm -f "$SYSTEM_OUT_DIR"/lib/libuv.so*
 cp -a "$TPU_SDK_INSTALL_PATH"/opencv/lib/*.so* "$SYSTEM_OUT_DIR"/lib/
