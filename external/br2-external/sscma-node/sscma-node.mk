@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-SSCMA_NODE_VERSION = 0.2.1
+SSCMA_NODE_VERSION = main
 SSCMA_NODE_SITE = https://github.com/smuraro/sscma-example-sg200x
 SSCMA_NODE_SITE_METHOD = git
 SSCMA_NODE_GIT_SUBMODULES = YES
@@ -35,7 +35,7 @@ define SSCMA_NODE_INSTALL_TARGET_CMDS
 	#$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red node-red-contrib-seeed-canbus
 	#$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red node-red-contrib-seeed-recamera
 
-	$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red @flowfuse/node-red-dashboard@1.26.0
+	$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red @flowfuse/node-red-dashboard@1.29.0
 	#$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red socketcan@4.0.5
 
 	# Install the executable file
