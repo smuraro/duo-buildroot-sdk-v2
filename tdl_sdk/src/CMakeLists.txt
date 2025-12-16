@@ -59,6 +59,10 @@ add_library(tdl_core SHARED ${CORES_SRCS})
 target_link_libraries(tdl_core
    ${MLIR_LIBS}
    ${OPENCV_LIBS_IMCODEC}
+   ${TOP_DIR}/cvi_mpi/lib/libsys.so
+   ${TOP_DIR}/cvi_mpi/lib/libvpss.so
+   ${TOP_DIR}/cvi_mpi/lib/libvo.so
+   ${TOP_DIR}/cvi_mpi/lib/libvenc.so
    ${IVE_LIBS}
    ${ZLIB_LIBRARY}
    kaldi-native-fbank-core
@@ -73,6 +77,48 @@ target_link_libraries(tdl_core
 add_library(tdl_ex SHARED ${EX_SRCS})
 target_link_libraries(tdl_ex ${LIBWEBSOCKETS_LIBS}
                       ${OPENSSL_LIBRARY}
+   ###/home/sergio/sophpi/cvi_mpi/lib/libsys.so
+   ${TOP_DIR}/cvi_mpi/lib/3rd/libini.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/3rd/libsbc.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libcvikernel.so
+   ${TOP_DIR}/cvi_mpi/lib/libcvi_bin.so
+   ${TOP_DIR}/cvi_mpi/lib/libcvi_bin_isp.so
+   ${TOP_DIR}/cvi_mpi/lib/libsns_full.so
+   ${TOP_DIR}/cvi_mpi/lib/libsample.so
+   ${TOP_DIR}/cvi_mpi/lib/libvo.so
+   ${TOP_DIR}/cvi_mpi/lib/libvi.so
+   ${TOP_DIR}/cvi_mpi/lib/libvenc.so
+   ${TOP_DIR}/cvi_mpi/lib/libvdec.so
+   ${TOP_DIR}/cvi_mpi/lib/libae.so
+   ${TOP_DIR}/cvi_mpi/lib/libaf.so
+   ${TOP_DIR}/cvi_mpi/lib/libawb.so
+   ${TOP_DIR}/cvi_mpi/lib/librgn.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libteaisp.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libmisc.so
+   ${TOP_DIR}/cvi_mpi/lib/libvpss.so
+   ${TOP_DIR}/cvi_mpi/lib/libisp.so
+   ${TOP_DIR}/cvi_mpi/lib/libisp_algo.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libmipi_tx.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libsns_gc2083.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libsns_gc4653.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libsns_ov5647.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libaaccomm2.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libaacdec2.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libaacenc2.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libaacsbrdec2.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libaacsbrenc2.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libcvi_dnvqe.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libcvi_ispd2.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libcvi_RES1.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libcvi_ssp.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libcvi_ssp2.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libcvi_VoiceEngine.so
+   ###/home/sergio/sophpi/cvi_mpi/lib/libcvi_vqe.so
+   
+   
+   ###/home/sergio/sophpi/cvi_mpi/lib/libcvi_audio.so
+
+   
                       ${ZLIB_LIBRARY}
                       ${CURL_LIBRARY})
 

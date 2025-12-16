@@ -1,5 +1,5 @@
 #include "py_image.hpp"
-#include "py_llm.hpp"
+//#include "py_llm.hpp"
 #include "py_model.hpp"
 #include "utils/tokenizer_bpe.hpp"
 using namespace pytdl;
@@ -107,6 +107,7 @@ PYBIND11_MODULE(tdl, m) {
          py::arg("device_id") = 0);
   nn.def("get_model_from_dir", get_model_with_dir, py::arg("model_type"),
          py::arg("model_dir") = "", py::arg("device_id") = 0);
+  /*
   py::module llm = m.def_submodule("llm", "LLM module");
   llm.def("fetch_video", &pytdl::fetch_video, py::arg("video_path"),
           py::arg("desired_fps") = 2.0, py::arg("desired_nframes") = 0,
@@ -114,6 +115,7 @@ PYBIND11_MODULE(tdl, m) {
   llm.def("test_fetch_video_ts", &pytdl::test_fetch_video_ts,
           py::arg("video_path"), py::arg("desired_fps") = 2.0,
           py::arg("desired_nframes") = 0, py::arg("max_video_sec") = 0);
+
   //   注册Qwen类
   py::class_<pytdl::PyQwen>(llm, "Qwen")
       .def(py::init<>())
@@ -153,6 +155,7 @@ PYBIND11_MODULE(tdl, m) {
       .def("__enter__", [](pytdl::PyQwen2VL& self) { return &self; })
       .def("__exit__", [](pytdl::PyQwen2VL& self, py::object, py::object,
                           py::object) { self.deinit(); });
+  */
   // 添加BytePairEncoder绑定
   py::module utils = m.def_submodule("utils", "Utility functions module");
 
