@@ -17,11 +17,10 @@ build*
 sophon_sdk
 _deps/
 *.jpg
-python_depends
 thirdparty
-dependency
 txt_root
 json_root
 tdl_sdk.code-workspace
 .cursor
 .ccls-cache
+!libpython3.10.so
