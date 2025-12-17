@@ -416,7 +416,7 @@ function build_tdl_sdk()
 
   if [[ -d "${tdl_lib}" ]]; then
     [[ ! -d "${lib_dir}" ]] && mkdir -p "${lib_dir}"
-    cp -af ${tdl_lib}/lib*.so "${lib_dir}"/
+    cp -af ${tdl_lib}/*.so "${lib_dir}"/
   fi
 
   if [[ -d "${tdl_utils}" ]]; then
