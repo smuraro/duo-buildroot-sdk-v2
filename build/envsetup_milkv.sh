@@ -412,7 +412,7 @@ function build_tdl_sdk()
 
   tdl_lib="${TDL_SDK_PATH}/install/${CHIP_ARCH}/lib"
   tdl_utils="${TDL_SDK_PATH}/install/${CHIP_ARCH}/sample/utils/lib"
-  tdl_app="${TDL_SDK_PATH}/install/${CHIP_ARCH}/bin/c"
+  tdl_app="${TDL_SDK_PATH}/install/${CHIP_ARCH}/bin/cpp"
 
   if [[ -d "${tdl_lib}" ]]; then
     [[ ! -d "${lib_dir}" ]] && mkdir -p "${lib_dir}"
@@ -426,7 +426,7 @@ function build_tdl_sdk()
 
   if [[ -d "${tdl_app}" ]]; then
     [[ ! -d "${app_dir}" ]] && mkdir -p "${app_dir}"
-    cp -af "${tdl_app}"/sample_* "${app_dir}"/
+    cp -af "${tdl_app}"/* "${app_dir}"/
   fi
 }
 
