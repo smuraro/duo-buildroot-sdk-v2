@@ -409,10 +409,12 @@ function build_tdl_sdk()
 
   lib_dir="${SYSTEM_OUT_DIR}/lib"
   app_dir="${SYSTEM_OUT_DIR}/usr/bin/ai"
+  model_json_dir="${SYSTEM_OUT_DIR}/configs/model"
 
   tdl_lib="${TDL_SDK_PATH}/install/${CHIP_ARCH}/lib"
   tdl_utils="${TDL_SDK_PATH}/install/${CHIP_ARCH}/sample/utils/lib"
   tdl_app="${TDL_SDK_PATH}/install/${CHIP_ARCH}/bin/cpp"
+  tdl_model_json="${TDL_SDK_PATH}/install/${CHIP_ARCH}/configs/model"
 
   if [[ -d "${tdl_lib}" ]]; then
     [[ ! -d "${lib_dir}" ]] && mkdir -p "${lib_dir}"
@@ -427,6 +429,11 @@ function build_tdl_sdk()
   if [[ -d "${tdl_app}" ]]; then
     [[ ! -d "${app_dir}" ]] && mkdir -p "${app_dir}"
     cp -af "${tdl_app}"/* "${app_dir}"/
+  fi
+  
+  if [[ -d "${tdl_model_json}" ]]; then
+    [[ ! -d "${model_json_dir}" ]] && mkdir -p "${model_json_dir}"
+    cp -af "${tdl_model_json}"/* "${model_json_dir}"/
   fi
 }
 
