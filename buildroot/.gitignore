@@ -13,3 +13,6 @@
 *.rej
 *~
 *.pyc
+/package/vlc
+/package/libuv
+/package/nodejs
