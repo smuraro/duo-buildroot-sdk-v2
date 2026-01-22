@@ -35,7 +35,7 @@ define SSCMA_NODE_INSTALL_TARGET_CMDS
 	#$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red node-red-contrib-seeed-canbus
 	#$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red node-red-contrib-seeed-recamera
 
-	$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red @flowfuse/node-red-dashboard@1.30.1
+	$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red @flowfuse/node-red-dashboard@1.30.2
 	#$(NPM) install --no-audit --no-update-notifier --no-fund --save --save-prefix=~ --production --engine-strict --prefix $(TARGET_DIR)/root/.node-red socketcan@4.0.5
 
 	# Install the executable file
