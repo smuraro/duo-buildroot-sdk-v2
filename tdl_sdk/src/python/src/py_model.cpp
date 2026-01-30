@@ -406,6 +406,7 @@ PyModel get_model_from_dir(const ModelType model_type,
                            const std::string& model_dir, const int device_id) {
   TDLModelFactory& model_factory = TDLModelFactory::getInstance();
   model_factory.setModelDir(model_dir);
+  model_factory.loadModelConfig();
   auto model = model_factory.getModel(model_type, device_id);
   if (model == nullptr) {
     throw std::runtime_error("Failed to create model");

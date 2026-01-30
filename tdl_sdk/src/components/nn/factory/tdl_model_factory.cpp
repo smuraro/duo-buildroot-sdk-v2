@@ -223,7 +223,6 @@ ModelConfig TDLModelFactory::getModelConfig(const ModelType model_type) {
 
 void TDLModelFactory::setModelDir(const std::string &model_dir) {
   model_dir_ = model_dir;
-  loadModelConfig();
   LOGIP("setModelDir success,model_dir:%s", model_dir.c_str());
 }
 
