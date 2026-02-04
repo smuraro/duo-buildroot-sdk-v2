@@ -1,0 +1,27 @@
+diff --git a/Makefile b/Makefile
+index 539496b..a35552e 100644
+--- a/lua-periphery/Makefile
++++ b/lua-periphery/Makefile
+@@ -20,7 +20,7 @@ LUA_LIBDIR ?= $(shell pkg-config --variable=INSTALL_CMOD $(LUA))
+ 
+ MOD_CFLAGS = $(CFLAGS)
+ MOD_CFLAGS += -std=c99 -pedantic -D_XOPEN_SOURCE=700
+-MOD_CFLAGS += -Wall -Wextra -Wno-unused-parameter $(DEBUG) -fPIC -I. $(LUA_CFLAGS)
++MOD_CFLAGS += -Wall -Wextra -Wno-unused-parameter -g$(DEBUG) -fPIC -I. $(LUA_CFLAGS)
+ 
+ MOD_LDFLAGS = $(LDFLAGS)
+ MOD_LDFLAGS += -shared
+Submodule c-periphery contains modified content
+diff --git a/c-periphery/Makefile b/c-periphery/Makefile
+index 9684a95..998beeb 100644
+--- a/lua-periphery/c-periphery/Makefile
++++ b/lua-periphery/c-periphery/Makefile
+@@ -25,7 +25,7 @@ COMMIT_ID := $(shell git describe --abbrev --always --tags --dirty 2>$(NULL) ||
+ OPT ?= -O3
+ CFLAGS += -std=gnu99 -pedantic
+ CFLAGS += $(OPT)
+-CFLAGS += -Wall -Wextra -Wno-stringop-truncation $(DEBUG) -fPIC
++CFLAGS += -Wall -Wextra -Wno-stringop-truncation -g$(DEBUG) -fPIC
+ CFLAGS += -DPERIPHERY_VERSION_COMMIT=\"$(COMMIT_ID)\" -DPERIPHERY_GPIO_CDEV_SUPPORT=$(GPIO_CDEV_SUPPORT)
+ LDFLAGS +=
+ 
