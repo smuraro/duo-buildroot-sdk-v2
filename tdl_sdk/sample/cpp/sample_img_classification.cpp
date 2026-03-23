@@ -3,12 +3,12 @@
 
 int main(int argc, char** argv) {
   if (argc != 4) {
-    printf("Usage: %s <model_file> <model_type> <image_path>\n", argv[0]);
+    printf("Usage: %s <model_type> <model_dir> <image_path>\n", argv[0]);
     return -1;
   }
 
-  std::string model_file = argv[1];
-  std::string model_type = argv[2];
+  std::string model_type = argv[1];
+  std::string model_dir = argv[2];
   std::string image_path = argv[3];
 
   auto image = ImageFactory::readImage(image_path);
@@ -18,9 +18,11 @@ int main(int argc, char** argv) {
   }
 
   TDLModelFactory& model_factory = TDLModelFactory::getInstance();
+  model_factory.loadModelConfig();
+  model_factory.setModelDir(model_dir);
 
   std::shared_ptr<BaseModel> model_cls =
-      model_factory.getModel(model_type, model_file);
+      model_factory.getModel(model_type);
 
   if (!model_cls) {
     printf("Failed to load classification model\n");
