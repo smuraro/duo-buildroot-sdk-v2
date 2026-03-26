@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-SSCMA_NODE_VERSION = main
+SSCMA_NODE_VERSION = teste
 SSCMA_NODE_SITE = https://github.com/smuraro/sscma-example-sg200x
 SSCMA_NODE_SITE_METHOD = git
 SSCMA_NODE_GIT_SUBMODULES = YES

@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-SSCMA_SUPERVISOR_VERSION = main
+SSCMA_SUPERVISOR_VERSION = teste
 SSCMA_SUPERVISOR_SITE = https://github.com/smuraro/sscma-example-sg200x
 SSCMA_SUPERVISOR_SITE_METHOD = git
 SSCMA_SUPERVISOR_GIT_SUBMODULES = YES
