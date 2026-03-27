@@ -1,0 +1,27 @@
+#!/bin/sh
+
+DAEMON="ttyd"
+DAEMON_PATH="/usr/bin/ttyd"
+DAEMON_ARGS="-W -p 9090 login"
+PIDFILE="/var/run/ttyd.pid"
+
+case "$1" in
+  start)
+    echo "Starting $DAEMON..."
+    start-stop-daemon -S -q -b -m -p $PIDFILE -x $DAEMON_PATH -- $DAEMON_ARGS
+    ;;
+  stop)
+    echo "Stopping $DAEMON..."
+    start-stop-daemon -K -q -p $PIDFILE
+    rm -f $PIDFILE
+    ;;
+  restart|reload)
+    "$0" stop
+    "$0" start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+esac
+
+exit $?
