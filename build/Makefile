@@ -610,9 +610,37 @@ br-rootfs-prepare:export CROSS_COMPILE_SDK=$(patsubst "%",%,$(CONFIG_CROSS_COMPI
 br-rootfs-prepare:
 	$(call print_target)
 
+	# remove OSS curl/libcurl only if buildroot's libcurl is selected,
+	# to avoid conflicts with /usr/bin/curl and /usr/lib/libcurl.so.4.
+	# Delete from SYSTEM_OUT_DIR before cp (prevents adding) and from BR_ROOTFS_DIR
+	# after cp (removes stale files from previous builds, since BR_ROOTFS_DIR is never cleaned).
+	${Q}if grep -qs "^BR2_PACKAGE_LIBCURL_CURL=y" $(BR_DIR)/configs/$(BR_DEFCONFIG); then \
+		echo "[br-rootfs-prepare] BR2_PACKAGE_LIBCURL_CURL=y: removing OSS curl to avoid conflict"; \
+		rm -f ${SYSTEM_OUT_DIR}/lib/libcurl.so \
+		      ${SYSTEM_OUT_DIR}/lib/libcurl.so.4 \
+		      ${SYSTEM_OUT_DIR}/lib/libcurl.so.4.8.0 \
+		      ${SYSTEM_OUT_DIR}/usr/bin/tpu/curl \
+		      ${SYSTEM_OUT_DIR}/usr/bin/tpu/curl-config; \
+	fi
+
 	# copy ko and mmf libs
 	${Q}mkdir -p $(BR_ROOTFS_DIR)/mnt/system
 	${Q}cp -arf ${SYSTEM_OUT_DIR}/* $(BR_ROOTFS_DIR)/mnt/system/
+
+	# remove stale OSS curl from BR_ROOTFS_DIR and buildroot target dir (both may retain
+	# files from previous builds since neither is fully cleaned between builds)
+	${Q}if grep -qs "^BR2_PACKAGE_LIBCURL_CURL=y" $(BR_DIR)/configs/$(BR_DEFCONFIG); then \
+		rm -f $(BR_ROOTFS_DIR)/mnt/system/lib/libcurl.so \
+		      $(BR_ROOTFS_DIR)/mnt/system/lib/libcurl.so.4 \
+		      $(BR_ROOTFS_DIR)/mnt/system/lib/libcurl.so.4.8.0 \
+		      $(BR_ROOTFS_DIR)/mnt/system/usr/bin/tpu/curl \
+		      $(BR_ROOTFS_DIR)/mnt/system/usr/bin/tpu/curl-config; \
+		rm -f $(BR_DIR)/output/$(BR_BOARD)/target/mnt/system/lib/libcurl.so \
+		      $(BR_DIR)/output/$(BR_BOARD)/target/mnt/system/lib/libcurl.so.4 \
+		      $(BR_DIR)/output/$(BR_BOARD)/target/mnt/system/lib/libcurl.so.4.8.0 \
+		      $(BR_DIR)/output/$(BR_BOARD)/target/mnt/system/usr/bin/tpu/curl \
+		      $(BR_DIR)/output/$(BR_BOARD)/target/mnt/system/usr/bin/tpu/curl-config; \
+	fi
 
 	# copy milkv buildroot overlay files
 	${Q}cp -arf $(TOP_DIR)/device/generic/br_overlay/common/* $(BR_ROOTFS_DIR)/
