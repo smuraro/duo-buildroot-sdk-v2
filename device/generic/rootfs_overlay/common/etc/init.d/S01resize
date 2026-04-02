@@ -1,0 +1,93 @@
+#!/bin/sh
+#
+# S01resize - Expand rootfs partition and filesystem to fill the storage device.
+# Runs only once: creates /root/.resize_done as a flag after success.
+#
+# Works for all Duo board variants (SD and eMMC) by detecting the root
+# device dynamically from /proc/mounts instead of hard-coding partition numbers:
+#
+#   Duo S  SD   : BOOT(p1) + MISC(p2)  + ROOTFS(p3) -> mmcblk0p3
+#   Duo S  eMMC : BOOT(p1) + MISC(p2)  + ENV(p3)    + ROOTFS(p4) -> mmcblk0p4
+#   Duo256m SD  : BOOT(p1) + ROOTFS(p2)              -> mmcblk0p2
+#   Duo    SD   : BOOT(p1) + ROOTFS(p2)              -> mmcblk0p2
+#
+
+DONE_FLAG="/root/.resize_done"
+
+case "$1" in
+  start)
+    [ -f "$DONE_FLAG" ] && exit 0
+
+    # Resolve the real block device for the root filesystem.
+    # /proc/mounts often shows "/dev/root" (a kernel alias) instead of the
+    # real device. Use /proc/self/mountinfo which provides the actual
+    # major:minor numbers, then look up the device name in /sys/dev/block/.
+    #
+    # /proc/self/mountinfo field 3 is "maj:min", field 5 is mountpoint.
+    MAJ_MIN=$(awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
+    if [ -z "$MAJ_MIN" ]; then
+      echo "S01resize: cannot read mountinfo, skipping." >&2
+      exit 1
+    fi
+
+    DEVNAME=$(grep DEVNAME /sys/dev/block/${MAJ_MIN}/uevent 2>/dev/null | cut -d= -f2)
+    if [ -z "$DEVNAME" ]; then
+      echo "S01resize: cannot resolve device for $MAJ_MIN, skipping." >&2
+      exit 1
+    fi
+    ROOT_DEV="/dev/$DEVNAME"
+
+    # Derive disk and partition number
+    # e.g. /dev/mmcblk0p3 -> DISK=/dev/mmcblk0, PART_NUM=3
+    DISK=$(echo "$ROOT_DEV" | sed 's/p[0-9]*$//')
+    PART_NUM=$(echo "$ROOT_DEV" | grep -o '[0-9]*$')
+
+    echo "S01resize: expanding $ROOT_DEV (disk=$DISK part=$PART_NUM) ..."
+
+    # eMMC has hardware boot partitions (/dev/mmcblk0boot0); SD does not.
+    # For eMMC the rootfs partition already fills the chip, so only the
+    # filesystem needs expanding (parted can't read the proprietary CVI
+    # partition table on eMMC and is not needed there).
+    # For SD the card may be larger than the image, so we expand the
+    # partition first, then the filesystem.
+    if [ -b "${DISK}boot0" ]; then
+      # --- eMMC: filesystem resize only ---
+      echo "S01resize: eMMC detected, resizing filesystem only..."
+    else
+      # --- SD: expand partition to fill card, then filesystem ---
+      echo "S01resize: SD detected, resizing partition then filesystem..."
+      parted -s "$DISK" resizepart "$PART_NUM" 100%
+      if [ $? -ne 0 ]; then
+        echo "S01resize: parted resizepart failed, aborting." >&2
+        exit 1
+      fi
+      # Notify kernel of updated partition table and wait for it to settle
+      partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null
+      sleep 1
+    fi
+
+    # Extend the ext4 filesystem to fill the (possibly expanded) partition
+    resize2fs "$ROOT_DEV"
+    if [ $? -ne 0 ]; then
+      echo "S01resize: resize2fs failed." >&2
+      exit 1
+    fi
+
+    echo "S01resize: done."
+    touch "$DONE_FLAG"
+    ;;
+
+  stop)
+    ;;
+
+  restart|reload)
+    "$0" start
+    ;;
+
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+
+exit 0
