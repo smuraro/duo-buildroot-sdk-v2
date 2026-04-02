@@ -14,6 +14,7 @@ inline void parse_cls_info(T *p_cls_ptr, int num_anchor, int num_cls,
   int max_logit_c = -1;
   float max_logit = -1000;
   for (int c = 0; c < num_cls; c++) {
+    // NCHW: data[c][h][w] = ptr[(c + cls_offset) * num_anchor + anchor_idx]
     float logit = p_cls_ptr[(c + cls_offset) * num_anchor + anchor_idx];
     if (logit > max_logit) {
       max_logit = logit;
@@ -57,9 +58,42 @@ YoloV8Detection::YoloV8Detection(std::pair<int, int> yolov8_pair) {
 // featuremap,3 output decoded results
 int32_t YoloV8Detection::onModelOpened() {
   const auto &input_layer = net_->getInputNames()[0];
-  auto input_shape = net_->getTensorInfo(input_layer).shape;
-  int input_h = input_shape[2];
-  int input_w = input_shape[3];
+  TensorInfo input_tensor_info = net_->getTensorInfo(input_layer);
+  auto input_shape = input_tensor_info.shape;
+  // Support NHWC [N,H,W,C] (sscma/YOLO11 cvimodels) and NCHW [N,C,H,W].
+  // Heuristic: if the last dim is 1 or 3 it is the channel count → NHWC.
+  int input_h, input_w;
+  bool is_nhwc_input = (input_shape[3] == 1 || input_shape[3] == 3);
+  if (is_nhwc_input) {
+    input_h = input_shape[1];
+    input_w = input_shape[2];
+    is_nhwc_input_ = true;
+    nhwc_model_h_ = input_h;
+    nhwc_model_w_ = input_w;
+    PreprocessParams& pp = preprocess_params_[input_layer];
+    // Disable VPSS normalization — handled in postPreprocess if needed.
+    for (int i = 0; i < 3; i++) {
+      pp.scale[i] = 1.0f;
+      pp.mean[i]  = 0.0f;
+    }
+    // sscma uses pure stretch (no letterbox).
+    pp.keep_aspect_ratio = false;
+    // Use bilinear (VPSS default is bicubic=0; bilinear=1 is close enough).
+    pp.use_nearest_resize = false;
+    // Only subtract 128 in postPreprocess when input dtype is INT8.
+    // sscma: if (input_.type == MA_TENSOR_TYPE_S8) { subtract 128 }
+    // For UINT8 inputs the CVI compiler folds the bias into the first layer.
+    nhwc_sw_norm_128_ = (input_tensor_info.data_type == TDLDataType::INT8);
+    LOGI("input format: NHWC [%d,%d,%d,%d] dtype=%d sw_norm_128=%d",
+         input_shape[0], input_shape[1], input_shape[2], input_shape[3],
+         static_cast<int>(input_tensor_info.data_type), (int)nhwc_sw_norm_128_);
+  } else {
+    // NCHW (standard)
+    input_h = input_shape[2];
+    input_w = input_shape[3];
+    LOGI("input format: NCHW  [%d,%d,%d,%d]",
+         input_shape[0], input_shape[1], input_shape[2], input_shape[3]);
+  }
   strides.clear();
   const auto &output_layers = net_->getOutputNames();
   size_t num_output = output_layers.size();
@@ -78,20 +112,6 @@ int32_t YoloV8Detection::onModelOpened() {
     int channel = oinfo.shape[1];
     int stride_h = input_h / feat_h;
     int stride_w = input_w / feat_w;
-
-    // if (stride_h == 0 && num_output == 2) {
-    //   if (channel == num_cls_) {
-    //     class_out_names[stride_h] = output_layers[j];
-    //     strides.push_back(stride_h);
-    //     LOGI("parse class decode branch:%s,channel:%d\n",
-    //          output_layers[j].c_str(), channel);
-    //   } else {
-    //     bbox_out_names[stride_h] = output_layers[j];
-    //     LOGI("parse box decode branch:%s,channel:%d\n",
-    //          output_layers[j].c_str(), channel);
-    //   }
-    //   continue;
-    // }
 
     if (stride_h != stride_w) {
       LOGE("stride not equal,stridew:%d,strideh:%d,featw:%d,feath:%d\n",
@@ -145,6 +165,22 @@ int32_t YoloV8Detection::onModelOpened() {
 }
 
 YoloV8Detection::~YoloV8Detection() {}
+
+void YoloV8Detection::postPreprocess(std::shared_ptr<BaseTensor> tensor,
+                                     int batch_idx) {
+  if (!is_nhwc_input_ || !nhwc_sw_norm_128_) return;
+  // INT8 input: sscma subtracts 128 (pixel - 128 = int8 value).
+  // uint8 arithmetic gives correct INT8 bit patterns:
+  //   pixel=0   → 0   - 128 = 128 as uint8 → -128 as int8  ✓
+  //   pixel=128 → 128 - 128 = 0             → 0   as int8  ✓
+  //   pixel=255 → 255 - 128 = 127           → 127 as int8  ✓
+  int batch_bytes = tensor->getCapacity() / tensor->getBatchSize();
+  uint8_t* data = tensor->getBatchPtr<uint8_t>(batch_idx);
+  for (int i = 0; i < batch_bytes; i++) {
+    data[i] -= 128u;
+  }
+  tensor->flushCache();
+}
 
 // the bbox featuremap shape is b x 4*regmax x h   x w
 void YoloV8Detection::decodeBboxFeatureMap(int batch_idx, int stride,
@@ -213,13 +249,21 @@ void YoloV8Detection::decodeBboxFeatureMap(int batch_idx, int stride,
       (grid_x + box_vals[2]) * stride, (grid_y + box_vals[3]) * stride};
   decode_box = box;
 }
+
 int32_t YoloV8Detection::outputParse(
     const std::vector<std::shared_ptr<BaseImage>> &images,
     std::vector<std::shared_ptr<ModelOutputInfo>> &out_datas) {
   std::string input_tensor_name = net_->getInputNames()[0];
   TensorInfo input_tensor = net_->getTensorInfo(input_tensor_name);
-  uint32_t input_width = input_tensor.shape[3];
-  uint32_t input_height = input_tensor.shape[2];
+  // Same NHWC/NCHW detection as onModelOpened()
+  uint32_t input_width, input_height;
+  if (input_tensor.shape[3] == 1 || input_tensor.shape[3] == 3) {
+    input_height = input_tensor.shape[1];
+    input_width  = input_tensor.shape[2];
+  } else {
+    input_height = input_tensor.shape[2];
+    input_width  = input_tensor.shape[3];
+  }
   float input_width_f = float(input_width);
   float input_height_f = float(input_height);
   float inverse_th = std::log(model_threshold_ / (1 - model_threshold_));
@@ -230,7 +274,6 @@ int32_t YoloV8Detection::outputParse(
       input_tensor.shape[2], input_tensor.shape[3], model_threshold_,
       inverse_th);
 
-  // std::stringstream ss;
   for (uint32_t b = 0; b < (uint32_t)input_tensor.shape[0]; b++) {
     uint32_t image_width = images[b]->getWidth();
     uint32_t image_height = images[b]->getHeight();
@@ -238,6 +281,8 @@ int32_t YoloV8Detection::outputParse(
     std::map<int, std::vector<ObjectBoxInfo>> lb_boxes;
     for (size_t i = 0; i < strides.size(); i++) {
       int stride = strides[i];
+
+      // ── cls tensor (fetched once per stride) ────────────────────────────
       std::string cls_name;
       int cls_offset = 0;
       if (class_out_names.count(stride)) {
@@ -248,51 +293,110 @@ int32_t YoloV8Detection::outputParse(
       }
       TensorInfo classinfo = net_->getTensorInfo(cls_name);
       std::shared_ptr<BaseTensor> cls_tensor = net_->getOutputTensor(cls_name);
-
       int num_per_pixel = classinfo.tensor_size / classinfo.tensor_elem;
-
-      int num_cls = num_cls_;
+      int num_cls    = num_cls_;
       int num_anchor = classinfo.shape[2] * classinfo.shape[3];
+      float cls_qscale = num_per_pixel == 1 ? classinfo.qscale : 1;
+
+      // ── box tensor (fetched once per stride) ────────────────────────────
+      std::string box_name = bbox_out_names.count(stride)
+                                 ? bbox_out_names.at(stride)
+                                 : bbox_class_out_names.at(stride);
+      TensorInfo boxinfo = net_->getTensorInfo(box_name);
+      std::shared_ptr<BaseTensor> box_tensor = net_->getOutputTensor(box_name);
+      int box_feat_w    = boxinfo.shape[3];
+      int box_num_anchor = boxinfo.shape[2] * boxinfo.shape[3];
+      float box_qscale  = boxinfo.qscale;
+
+      // For sscma/NHWC models: use BOX qscale for cls scores
+      if (is_nhwc_input_ && box_qscale > 0) cls_qscale = box_qscale;
+
       LOGI("stride:%d,featw:%d,feath:%d,numperpixel:%d,numcls:%d,qscale:%f\n",
            stride, classinfo.shape[3], classinfo.shape[2],
-           classinfo.tensor_size / classinfo.tensor_elem, num_cls,
-           classinfo.qscale);
-      float cls_qscale = num_per_pixel == 1 ? classinfo.qscale : 1;
+           num_per_pixel, num_cls, cls_qscale);
+
+      // ── batch pointers (fetched once per stride, not per anchor) ────────
+      void *cls_ptr = nullptr;
+      if (classinfo.data_type == TDLDataType::INT8)
+        cls_ptr = cls_tensor->getBatchPtr<int8_t>(b);
+      else if (classinfo.data_type == TDLDataType::UINT8)
+        cls_ptr = cls_tensor->getBatchPtr<uint8_t>(b);
+      else if (classinfo.data_type == TDLDataType::FP32)
+        cls_ptr = cls_tensor->getBatchPtr<float>(b);
+      else {
+        LOGE("unsupported cls data type:%d\n",
+             static_cast<int>(classinfo.data_type));
+        continue;
+      }
+
+      void *box_ptr = nullptr;
+      if (boxinfo.data_type == TDLDataType::INT8)
+        box_ptr = box_tensor->getBatchPtr<int8_t>(b);
+      else if (boxinfo.data_type == TDLDataType::UINT8)
+        box_ptr = box_tensor->getBatchPtr<uint8_t>(b);
+      else if (boxinfo.data_type == TDLDataType::FP32)
+        box_ptr = box_tensor->getBatchPtr<float>(b);
+      else {
+        LOGE("unsupported box data type:%d\n",
+             static_cast<int>(boxinfo.data_type));
+        continue;
+      }
+
       for (int j = 0; j < num_anchor; j++) {
-        int max_logit_c = -1;
-        float max_logit = -1000;
-        if (classinfo.data_type == TDLDataType::INT8) {
-          parse_cls_info<int8_t>(cls_tensor->getBatchPtr<int8_t>(b), num_anchor,
-                                 num_cls, j, cls_offset, cls_qscale, &max_logit,
-                                 &max_logit_c);
-        } else if (classinfo.data_type == TDLDataType::UINT8) {
-          parse_cls_info<uint8_t>(cls_tensor->getBatchPtr<uint8_t>(b),
-                                  num_anchor, num_cls, j, cls_offset,
-                                  cls_qscale, &max_logit, &max_logit_c);
-        } else if (classinfo.data_type == TDLDataType::FP32) {
-          parse_cls_info<float>(cls_tensor->getBatchPtr<float>(b), num_anchor,
-                                num_cls, j, cls_offset, cls_qscale, &max_logit,
-                                &max_logit_c);
-        } else {
-          LOGE("unsupported data type:%d\n",
-               static_cast<int>(classinfo.data_type));
-          assert(0);
+        // ── class score ───────────────────────────────────────────────────
+        int   max_logit_c = -1;
+        float max_logit   = -1000;
+        if (classinfo.data_type == TDLDataType::INT8)
+          parse_cls_info(static_cast<int8_t *>(cls_ptr), num_anchor, num_cls,
+                         j, cls_offset, cls_qscale, &max_logit, &max_logit_c);
+        else if (classinfo.data_type == TDLDataType::UINT8)
+          parse_cls_info(static_cast<uint8_t *>(cls_ptr), num_anchor, num_cls,
+                         j, cls_offset, cls_qscale, &max_logit, &max_logit_c);
+        else
+          parse_cls_info(static_cast<float *>(cls_ptr), num_anchor, num_cls,
+                         j, cls_offset, cls_qscale, &max_logit, &max_logit_c);
+
+        if (max_logit < inverse_th) continue;
+
+        // ── DFL box decode (inline, no extra lookup) ──────────────────────
+        float grid_x = static_cast<float>(j % box_feat_w) + 0.5f;
+        float grid_y = static_cast<float>(j / box_feat_w) + 0.5f;
+
+        std::vector<float> grid_logits;
+        if (boxinfo.data_type == TDLDataType::INT8)
+          grid_logits = get_box_vals(static_cast<int8_t *>(box_ptr),
+                                     box_num_anchor, j, num_box_channel_,
+                                     box_qscale);
+        else if (boxinfo.data_type == TDLDataType::UINT8)
+          grid_logits = get_box_vals(static_cast<uint8_t *>(box_ptr),
+                                     box_num_anchor, j, num_box_channel_,
+                                     box_qscale);
+        else
+          grid_logits = get_box_vals(static_cast<float *>(box_ptr),
+                                     box_num_anchor, j, num_box_channel_,
+                                     1.0f);
+
+        std::vector<float> box_vals;
+        for (int k = 0; k < 4; k++) {
+          float sum_s = 0, sum_v = 0;
+          for (int r = 0; r < 16; r++) {
+            float e = std::exp(grid_logits[k * 16 + r]);
+            sum_s += e;
+            sum_v += e * r;
+          }
+          box_vals.push_back(sum_v / sum_s);
         }
-        if (max_logit < inverse_th) {
-          continue;
-        }
-        float score = 1 / (1 + exp(-max_logit));
-        std::vector<float> box;
-        decodeBboxFeatureMap(b, stride, j, box);
+
+        float score = 1.0f / (1.0f + std::exp(-max_logit));
         ObjectBoxInfo bbox;
-        bbox.score = score;
-        bbox.x1 = std::max(0.0f, std::min(box[0], input_width_f));
-        bbox.y1 = std::max(0.0f, std::min(box[1], input_height_f));
-        bbox.x2 = std::max(0.0f, std::min(box[2], input_width_f));
-        bbox.y2 = std::max(0.0f, std::min(box[3], input_height_f));
+        bbox.score    = score;
+        bbox.x1 = std::max(0.0f, std::min((grid_x - box_vals[0]) * stride, input_width_f));
+        bbox.y1 = std::max(0.0f, std::min((grid_y - box_vals[1]) * stride, input_height_f));
+        bbox.x2 = std::max(0.0f, std::min((grid_x + box_vals[2]) * stride, input_width_f));
+        bbox.y2 = std::max(0.0f, std::min((grid_y + box_vals[3]) * stride, input_height_f));
         bbox.class_id = max_logit_c;
-        // LOGI("bbox:[%f,%f,%f,%f],score:%f,label:%d,logit:%f\n", bbox.x1,
-        //      bbox.y1, bbox.x2, bbox.y2, bbox.score, max_logit_c, max_logit);
+        LOGI("bbox:[%f,%f,%f,%f],score:%f,label:%d,logit:%f\n", bbox.x1,
+             bbox.y1, bbox.x2, bbox.y2, bbox.score, max_logit_c, max_logit);
 
         lb_boxes[max_logit_c].push_back(bbox);
       }
@@ -300,9 +404,6 @@ int32_t YoloV8Detection::outputParse(
     DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
     std::vector<float> scale_params =
         batch_rescale_params_[input_tensor_name][b];
-    // LOGI("scale_params:%f,%f,%f,%f", scale_params[0], scale_params[1],
-    //      scale_params[2], scale_params[3]);
-    // ss << "batch:" << b << "\n";
 
     std::shared_ptr<ModelBoxInfo> obj = std::make_shared<ModelBoxInfo>();
     obj->image_width = image_width;
@@ -314,12 +415,9 @@ int32_t YoloV8Detection::outputParse(
           b.object_type = type_mapping_[b.class_id];
         }
         obj->bboxes.push_back(b);
-        // ss << "bbox:[" << b.x1 << "," << b.y1 << "," << b.x2 << "," << b.y2
-        //    << "],score:" << b.score << ",label:" << bbox.first << "\n";
       }
     }
     out_datas.push_back(obj);
   }
-  // LOGI("outputParse done,ss:%s", ss.str().c_str());
   return 0;
 }

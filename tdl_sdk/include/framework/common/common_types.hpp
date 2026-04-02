@@ -100,6 +100,10 @@ struct PreprocessParams {
   float mean[3];
   float scale[3];  // Y=X*scale-mean
   bool keep_aspect_ratio;
+  // When true, VPSS uses nearest-neighbour interpolation instead of bilinear.
+  // Required for sscma/YOLO11 models whose weights were calibrated with the
+  // nearest-neighbour resize used by sscma's software RGB888 scaler.
+  bool use_nearest_resize;
 };
 
 struct ModelConfig {

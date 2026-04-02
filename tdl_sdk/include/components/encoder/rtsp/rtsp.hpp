@@ -12,6 +12,7 @@ struct RTSPContext {
   PAYLOAD_TYPE_E pay_load_type;
   int32_t frame_width;
   int32_t frame_height;
+  std::string session_name;
   CVI_RTSP_CTX *pstRtspContext;
   CVI_RTSP_SESSION *pstSession;
 };
@@ -19,7 +20,8 @@ struct RTSPContext {
 class RTSP {
  public:
   RTSP(int32_t chn = 0, PAYLOAD_TYPE_E pay_load_type = PT_H264,
-       int32_t frame_width = 1920, int32_t frame_height = 1080);
+       int32_t frame_width = 1920, int32_t frame_height = 1080,
+       const std::string& session_name = "");
   ~RTSP();
 
   int32_t sendFrame(VIDEO_FRAME_INFO_S *frame);

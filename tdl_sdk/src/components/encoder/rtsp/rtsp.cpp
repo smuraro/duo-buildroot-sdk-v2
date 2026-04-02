@@ -122,10 +122,12 @@ int32_t RTSP::initRTSP() {
   CVI_RTSP_SESSION_ATTR attr = {0};
   if (context_.pay_load_type == PT_H264) {
     attr.video.codec = RTSP_VIDEO_H264;
-    snprintf(attr.name, sizeof(attr.name), "h264");
+    const char* name = context_.session_name.empty() ? "h264" : context_.session_name.c_str();
+    snprintf(attr.name, sizeof(attr.name), "%s", name);
   } else if (context_.pay_load_type == PT_H265) {
     attr.video.codec = RTSP_VIDEO_H265;
-    snprintf(attr.name, sizeof(attr.name), "h265");
+    const char* name = context_.session_name.empty() ? "h265" : context_.session_name.c_str();
+    snprintf(attr.name, sizeof(attr.name), "%s", name);
   } else {
     return -1;
   }
@@ -168,12 +170,13 @@ int32_t RTSP::destroyRTSP() {
 }
 
 RTSP::RTSP(int32_t chn, PAYLOAD_TYPE_E pay_load_type, int32_t frame_width,
-           int32_t frame_height) {
+           int32_t frame_height, const std::string& session_name) {
   // 初始化RTSP上下文
   context_.chn = chn;
   context_.pay_load_type = pay_load_type;
   context_.frame_width = frame_width;
   context_.frame_height = frame_height;
+  context_.session_name = session_name;
   context_.pstRtspContext = nullptr;
   context_.pstSession = nullptr;
 

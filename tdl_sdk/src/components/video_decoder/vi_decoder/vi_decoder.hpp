@@ -29,6 +29,12 @@ class ViDecoder : public VideoDecoder {
 
  private:
   bool isInitialized = false;
+  // Tracks whether SAMPLE_COMM_SYS_Init was called, so deinitialize() is
+  // invoked even if initialization failed before isInitialized was set.
+  bool sysinit_done_ = false;
+  // VPSS groups allocated for each VI channel (dynamically assigned to avoid
+  // conflicts with model VpssPreprocessor groups).
+  std::vector<int32_t> vpss_grps_;
   std::vector<std::unique_ptr<MemoryBlock>> memory_blocks_;
   std::shared_ptr<BaseMemoryPool> memory_pool_ = nullptr;
   bool isMapped_ = false;

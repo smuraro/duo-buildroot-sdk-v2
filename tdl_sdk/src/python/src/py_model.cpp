@@ -20,6 +20,32 @@ py::list PyModel::inference(
   return inference(image);
 }
 
+py::list PyModel::inference(const PyImage& image, const py::dict& parameters) {
+  std::map<std::string, float> params;
+  for (auto item : parameters) {
+    params[item.first.cast<std::string>()] = item.second.cast<float>();
+  }
+  std::vector<std::shared_ptr<BaseImage>> images;
+  images.push_back(image.getImage());
+  std::vector<std::shared_ptr<ModelOutputInfo>> out_datas;
+  model_->inference(images, out_datas, params);
+  return outputParse(out_datas);
+}
+
+void PyModel::setThreshold(float threshold) {
+  model_->setModelThreshold(threshold);
+}
+
+float PyModel::getThreshold() const { return model_->getModelThreshold(); }
+
+std::vector<std::string> PyModel::getInputNames() const {
+  return model_->getInputNames();
+}
+
+std::vector<std::string> PyModel::getOutputNames() const {
+  return model_->getOutputNames();
+}
+
 py::list PyModel::outputParse(
     const std::vector<std::shared_ptr<ModelOutputInfo>>& out_datas) {
   std::shared_ptr<ModelOutputInfo> output_info = out_datas[0];
@@ -33,7 +59,18 @@ py::list PyModel::outputParse(
     for (auto& box : box_info->bboxes) {
       py::dict box_dict;
       box_dict[py::str("class_id")] = box.class_id;
-      box_dict[py::str("class_name")] = object_type_to_string(box.object_type);
+      std::string cls_name = object_type_to_string(box.object_type);
+      if (cls_name == "UNDEFINED") {
+        // Check model's class_name_map (e.g. COCO80 names set by factory).
+        const auto& name_map = model_->getClassNameMap();
+        auto it = name_map.find(box.class_id);
+        if (it != name_map.end()) {
+          cls_name = it->second;
+        } else {
+          cls_name = "cls" + std::to_string(box.class_id);
+        }
+      }
+      box_dict[py::str("class_name")] = cls_name;
       box_dict[py::str("x1")] = box.x1;
       box_dict[py::str("y1")] = box.y1;
       box_dict[py::str("x2")] = box.x2;

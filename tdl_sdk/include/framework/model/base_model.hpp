@@ -73,8 +73,14 @@ class BaseModel {
 
   virtual int32_t onModelOpened() { return 0; }
   virtual int32_t onModelClosed() { return 0; }
+  // Called after VPSS preprocessing for each image in a batch.
+  // Override to apply additional per-batch input tensor transforms.
+  virtual void postPreprocess(std::shared_ptr<BaseTensor> /*tensor*/,
+                              int /*batch_idx*/) {}
 
   void setTypeMapping(const std::map<int, TDLObjectType>& type_mapping);
+  void setClassNameMap(const std::map<int, std::string>& class_name_map);
+  const std::map<int, std::string>& getClassNameMap() const { return class_name_map_; }
   virtual void setModelThreshold(float threshold);
   virtual void setExportFeature(int flag);
   virtual float getModelThreshold() const { return model_threshold_; }
@@ -114,6 +120,7 @@ class BaseModel {
 
   std::vector<std::shared_ptr<BaseImage>> tmp_preprocess_images_;
   std::map<int, TDLObjectType> type_mapping_;
+  std::map<int, std::string> class_name_map_;
 
   Timer model_timer_;
 };

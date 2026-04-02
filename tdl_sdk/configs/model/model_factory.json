@@ -337,7 +337,42 @@
     },
     "RECOGNITION_SPEECH_ZIPFORMER_JOINER":{
       "file_name":"recognition_speech_zipformer_joiner-s_1_512_1_512_BF16"
+    },
+
+    "YOLOV11N_DET_PERSON_VEHICLE":{
+      "file_name":"yolov11n_det_person_vehicle_384_640_INT8"
+    },
+    "YOLOV11N_DET_HAND_FACE_PERSON":{
+      "file_name":"yolov11n_det_hand_face_person_384_640_INT8"
+    },
+    "YOLOV11N_DET_HEAD_PERSON":{
+      "file_name":"yolov11n_det_head_person_384_640_INT8"
+    },
+    "YOLOV11N_DET_FIRE_SMOKE":{
+      "file_name":"yolov11n_det_fire_smoke_384_640_INT8"
+    },
+    "YOLOV11":{
+      "file_name":"yolov11_640_640_INT8"
+    },
+
+    "YOLOV26_DET_COCO80":{
+      "file_name":"yolov26n_det_coco80_640_640_INT8"
+    },
+    "YOLOV26_DET_PERSON_VEHICLE":{
+      "file_name":"yolov26n_det_person_vehicle_640_640_INT8"
+    },
+    "YOLOV26_DET_HAND_FACE_PERSON":{
+      "file_name":"yolov26n_det_hand_face_person_640_640_INT8"
+    },
+    "YOLOV26_DET_HEAD_PERSON":{
+      "file_name":"yolov26n_det_head_person_640_640_INT8"
+    },
+    "YOLOV26_DET_FIRE_SMOKE":{
+      "file_name":"yolov26n_det_fire_smoke_640_640_INT8"
+    },
+    "YOLOV26":{
+      "file_name":"yolov26n_640_640_INT8"
     }
-    
+
   }
 }

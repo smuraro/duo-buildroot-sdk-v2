@@ -27,6 +27,7 @@
   X(YOLOV8_DET_COCO80, "")                                                    \
   X(YOLOV10_DET_COCO80, "")                                                   \
   X(YOLOV11N_DET_COCO80, "")                                                  \
+  X(YOLOV26_DET_COCO80, "")                                                   \
   X(PPYOLOE_DET_COCO80, "")                                                   \
   X(YOLOX_DET_COCO80, "")                                                     \
   /* custom object detection (need set num_cls) */                            \
@@ -36,6 +37,20 @@
   X(YOLOV8, "custom model, specify num_cls")                                  \
   X(YOLOV11N_DET_MONITOR_PERSON, "0:person")                                  \
   X(YOLOV11N_DET_BICYCLE_MOTOR_EBICYCLE, "0:bicycle,1:motorcycle,2:ebicycle") \
+  X(YOLOV11N_DET_PERSON_VEHICLE,                                              \
+    "0:car,1:bus,2:truck,3:rider with "                                       \
+    "motorcycle,4:person,5:bike,6:motorcycle")                                \
+  X(YOLOV11N_DET_HAND_FACE_PERSON, "0:hand,1:face,2:person")                  \
+  X(YOLOV11N_DET_HEAD_PERSON, "0:head,1:person")                              \
+  X(YOLOV11N_DET_FIRE_SMOKE, "0:fire,1:smoke")                                \
+  X(YOLOV11, "custom model, specify num_cls")                                 \
+  X(YOLOV26, "custom model, specify num_cls")                                 \
+  X(YOLOV26_DET_PERSON_VEHICLE,                                               \
+    "0:car,1:bus,2:truck,3:rider with "                                       \
+    "motorcycle,4:person,5:bike,6:motorcycle")                                \
+  X(YOLOV26_DET_HAND_FACE_PERSON, "0:hand,1:face,2:person")                   \
+  X(YOLOV26_DET_HEAD_PERSON, "0:head,1:person")                               \
+  X(YOLOV26_DET_FIRE_SMOKE, "0:fire,1:smoke")                                 \
   X(YOLOV10, "custom model, specify num_cls")                                 \
   X(PPYOLOE, "custom model, specify num_cls")                                 \
   X(YOLOX, "custom model, specify num_cls")                                   \

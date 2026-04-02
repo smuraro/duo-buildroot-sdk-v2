@@ -24,6 +24,7 @@
 #include "object_detection/yolov6.hpp"
 #include "object_detection/yolov7.hpp"
 #include "object_detection/yolov8.hpp"
+#include "object_detection/yolo26.hpp"
 #include "object_detection/yolox.hpp"
 #include "object_tracking/feartrack.hpp"
 #include "segmentation/topformer_seg.hpp"
@@ -114,7 +115,20 @@ bool TDLModelFactory::isObjectDetectionModel(const ModelType model_type) {
           model_type == ModelType::YOLOV6 || model_type == ModelType::PPYOLOE ||
           model_type == ModelType::YOLOV5 || model_type == ModelType::YOLOX ||
           model_type == ModelType::YOLOV7 ||
-          model_type == ModelType::MBV2_DET_PERSON);
+          model_type == ModelType::MBV2_DET_PERSON ||
+          // YOLO11 — same DFL decoder as YOLOv8
+          model_type == ModelType::YOLOV11N_DET_PERSON_VEHICLE ||
+          model_type == ModelType::YOLOV11N_DET_HAND_FACE_PERSON ||
+          model_type == ModelType::YOLOV11N_DET_HEAD_PERSON ||
+          model_type == ModelType::YOLOV11N_DET_FIRE_SMOKE ||
+          model_type == ModelType::YOLOV11 ||
+          // YOLO26 — 4-channel direct box decoder
+          model_type == ModelType::YOLOV26_DET_COCO80 ||
+          model_type == ModelType::YOLOV26_DET_PERSON_VEHICLE ||
+          model_type == ModelType::YOLOV26_DET_HAND_FACE_PERSON ||
+          model_type == ModelType::YOLOV26_DET_HEAD_PERSON ||
+          model_type == ModelType::YOLOV26_DET_FIRE_SMOKE ||
+          model_type == ModelType::YOLOV26);
 }
 
 bool TDLModelFactory::isFaceDetectionModel(const ModelType model_type) {
@@ -260,6 +274,30 @@ std::shared_ptr<BaseModel> TDLModelFactory::createObjectDetectionModel(
     model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_BICYCLE;
     model_type_mapping[1] = TDLObjectType::OBJECT_TYPE_MOTORBIKE;
     model_type_mapping[2] = TDLObjectType::OBJECT_TYPE_EBICYCLE;
+  } else if (model_type == ModelType::YOLOV11N_DET_PERSON_VEHICLE) {
+    model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_CAR;
+    model_type_mapping[1] = TDLObjectType::OBJECT_TYPE_BUS;
+    model_type_mapping[2] = TDLObjectType::OBJECT_TYPE_TRUCK;
+    model_type_mapping[3] = TDLObjectType::OBJECT_RIDER_WITH_MOTORCYCLE;
+    model_type_mapping[4] = TDLObjectType::OBJECT_TYPE_PERSON;
+    model_type_mapping[5] = TDLObjectType::OBJECT_TYPE_BICYCLE;
+    model_type_mapping[6] = TDLObjectType::OBJECT_TYPE_MOTORBIKE;
+    num_classes = 7;
+  } else if (model_type == ModelType::YOLOV11N_DET_HAND_FACE_PERSON) {
+    model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_HAND;
+    model_type_mapping[1] = TDLObjectType::OBJECT_TYPE_FACE;
+    model_type_mapping[2] = TDLObjectType::OBJECT_TYPE_PERSON;
+    num_classes = 3;
+  } else if (model_type == ModelType::YOLOV11N_DET_HEAD_PERSON) {
+    model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_HEAD;
+    model_type_mapping[1] = TDLObjectType::OBJECT_TYPE_PERSON;
+    num_classes = 2;
+  } else if (model_type == ModelType::YOLOV11N_DET_FIRE_SMOKE) {
+    model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_FIRE;
+    model_type_mapping[1] = TDLObjectType::OBJECT_TYPE_SMOKE;
+    num_classes = 2;
+  } else if (model_type == ModelType::YOLOV11) {
+    model_category = 10;  // YOLO11 (DFL, same as YOLOv8)
   } else if (model_type == ModelType::YOLOV8_DET_COCO80) {
     model_category = 0;  // YOLOV8
     num_classes = 80;
@@ -287,6 +325,37 @@ std::shared_ptr<BaseModel> TDLModelFactory::createObjectDetectionModel(
   } else if (model_type == ModelType::MBV2_DET_PERSON) {
     model_category = 6;  // MobileDetV2
     model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_PERSON;
+  } else if (model_type == ModelType::YOLOV26_DET_COCO80) {
+    model_category = 11;  // YOLO26
+    num_classes = 80;
+  } else if (model_type == ModelType::YOLOV26_DET_PERSON_VEHICLE) {
+    model_category = 11;
+    model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_CAR;
+    model_type_mapping[1] = TDLObjectType::OBJECT_TYPE_BUS;
+    model_type_mapping[2] = TDLObjectType::OBJECT_TYPE_TRUCK;
+    model_type_mapping[3] = TDLObjectType::OBJECT_RIDER_WITH_MOTORCYCLE;
+    model_type_mapping[4] = TDLObjectType::OBJECT_TYPE_PERSON;
+    model_type_mapping[5] = TDLObjectType::OBJECT_TYPE_BICYCLE;
+    model_type_mapping[6] = TDLObjectType::OBJECT_TYPE_MOTORBIKE;
+    num_classes = 7;
+  } else if (model_type == ModelType::YOLOV26_DET_HAND_FACE_PERSON) {
+    model_category = 11;
+    model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_HAND;
+    model_type_mapping[1] = TDLObjectType::OBJECT_TYPE_FACE;
+    model_type_mapping[2] = TDLObjectType::OBJECT_TYPE_PERSON;
+    num_classes = 3;
+  } else if (model_type == ModelType::YOLOV26_DET_HEAD_PERSON) {
+    model_category = 11;
+    model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_HEAD;
+    model_type_mapping[1] = TDLObjectType::OBJECT_TYPE_PERSON;
+    num_classes = 2;
+  } else if (model_type == ModelType::YOLOV26_DET_FIRE_SMOKE) {
+    model_category = 11;
+    model_type_mapping[0] = TDLObjectType::OBJECT_TYPE_FIRE;
+    model_type_mapping[1] = TDLObjectType::OBJECT_TYPE_SMOKE;
+    num_classes = 2;
+  } else if (model_type == ModelType::YOLOV26) {
+    model_category = 11;  // YOLO26 custom
   } else if (model_type == ModelType::YOLOV8) {
     model_category = 0;  // YOLOV8
   } else if (model_type == ModelType::YOLOV10) {
@@ -306,6 +375,12 @@ std::shared_ptr<BaseModel> TDLModelFactory::createObjectDetectionModel(
 
   if (model_category == 0) {
     model = std::make_shared<YoloV8Detection>(std::make_pair(64, num_classes));
+  } else if (model_category == 10) {
+    // YOLO11: identical DFL decode as YOLOv8 (64-channel box output)
+    model = std::make_shared<YoloV8Detection>(std::make_pair(64, num_classes));
+  } else if (model_category == 11) {
+    // YOLO26: 4-channel direct box output (no DFL)
+    model = std::make_shared<YoloV26Detection>(num_classes);
   } else if (model_category == 1) {
     model = std::make_shared<YoloV10Detection>(std::make_pair(64, num_classes));
   } else if (model_category == 2) {
@@ -329,6 +404,30 @@ std::shared_ptr<BaseModel> TDLModelFactory::createObjectDetectionModel(
   LOGIP("createObjectDetectionModel success,model type:%d,category:%d",
         static_cast<int>(model_type), model_category);
   model->setTypeMapping(model_type_mapping);
+
+  // Attach COCO80 class names for models that use the full 80-class set.
+  if (model_type == ModelType::YOLOV8_DET_COCO80 ||
+      model_type == ModelType::YOLOV11N_DET_COCO80 ||
+      model_type == ModelType::YOLOV26_DET_COCO80) {
+    static const char* kCoco80Names[80] = {
+      "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+      "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+      "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
+      "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+      "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+      "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+      "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+      "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+      "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+      "couch", "potted plant", "bed", "dining table", "toilet", "tv",
+      "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+      "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+      "scissors", "teddy bear", "hair drier", "toothbrush"
+    };
+    std::map<int, std::string> coco80_map;
+    for (int i = 0; i < 80; i++) coco80_map[i] = kCoco80Names[i];
+    model->setClassNameMap(coco80_map);
+  }
 
   return model;
 }

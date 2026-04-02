@@ -1,7 +1,22 @@
 project(tdl_python)
 
+# Set RTSP paths directly (mirrors what src/components/encoder/rtsp/CMakeLists.txt exports
+# via PARENT_SCOPE, but those variables are not visible here due to CMake scoping).
+if ("${CVI_PLATFORM}" STREQUAL "CV181X" OR "${CVI_PLATFORM}" STREQUAL "CV184X")
+    # TOP_DIR is the parent of REPO_DIR (set in the top-level CMakeLists.txt)
+    set(_CVI_RTSP_INSTALL ${TOP_DIR}/cvi_rtsp/install)
+    set(_RTSP_INCLUDE_LOCAL  ${_CVI_RTSP_INSTALL}/include/cvi_rtsp)
+    set(_RTSP_LIBS_STATIC_LOCAL
+        ${MLIR_SDK_ROOT}/lib/libBasicUsageEnvironment.a
+        ${MLIR_SDK_ROOT}/lib/libgroupsock.a
+        ${MLIR_SDK_ROOT}/lib/libUsageEnvironment.a
+        ${MLIR_SDK_ROOT}/lib/libliveMedia.a
+        ${_CVI_RTSP_INSTALL}/lib/libcvi_rtsp.a)
+    message(STATUS "RTSP include: ${_RTSP_INCLUDE_LOCAL}")
+    message(STATUS "RTSP libs: ${_RTSP_LIBS_STATIC_LOCAL}")
+endif()
 
-include_directories(    
+include_directories(
                     ${REPO_DIR}/include/framework
                     ${REPO_DIR}/include/nn
                     ${REPO_DIR}/include/components/matcher
@@ -14,7 +29,20 @@ include_directories(
                     ${REPO_DIR}/dependency/${CVI_PLATFORM}/python_depends/include/pybind11
                     )
 
+if ("${CVI_PLATFORM}" STREQUAL "CV181X" OR "${CVI_PLATFORM}" STREQUAL "CV184X")
+    include_directories(${_RTSP_INCLUDE_LOCAL}
+                        ${REPO_DIR}/include/components)
+    link_directories(${MLIR_LIBS} ${MIDDLEWARE_LIBS})
+endif()
+
 file(GLOB_RECURSE SRC_FRAMWORK_FILES_CUR ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+
+# Include rtsp.cpp directly so py_rtsp.cpp can link against it
+if ("${CVI_PLATFORM}" STREQUAL "CV181X" OR "${CVI_PLATFORM}" STREQUAL "CV184X")
+    list(APPEND SRC_FRAMWORK_FILES_CUR
+        ${REPO_DIR}/src/components/encoder/rtsp/rtsp.cpp)
+endif()
+
 # 添加tdl_image模块的源码
 add_library(${PROJECT_NAME} MODULE
     ${SRC_FRAMWORK_FILES_CUR}
@@ -35,6 +63,14 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     tdl_core
     tdl_ex
 )
+
+if ("${CVI_PLATFORM}" STREQUAL "CV181X" OR "${CVI_PLATFORM}" STREQUAL "CV184X")
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        "-Wl,--start-group"
+        ${_RTSP_LIBS_STATIC_LOCAL}
+        "-Wl,--end-group"
+    )
+endif()
 
 # 设置目标文件名
 set_target_properties(${PROJECT_NAME} PROPERTIES

@@ -1,6 +1,9 @@
+#include "py_camera.hpp"
 #include "py_image.hpp"
 //#include "py_llm.hpp"
+#include "py_matcher.hpp"
 #include "py_model.hpp"
+#include "py_rtsp.hpp"
 #include "utils/tokenizer_bpe.hpp"
 using namespace pytdl;
 using namespace pybind11::literals;
@@ -24,6 +27,7 @@ PyModel (*get_model_with_path)(ModelType, const std::string&, const py::dict&,
                                const int) = &get_model;
 PyModel (*get_model_with_dir)(ModelType, const std::string&,
                               const int) = &get_model_from_dir;
+
 
 // pybind11绑定实现
 PYBIND11_MODULE(tdl, m) {
@@ -86,6 +90,72 @@ PYBIND11_MODULE(tdl, m) {
       },
       py::arg("numpy_array"), py::arg("format") = ImageFormat::BGR_PACKED);
 
+  // 摄像头捕获类
+  py::class_<PyCamera>(image, "Camera")
+      .def(py::init<int32_t, int32_t, ImageFormat, int32_t>(),
+           py::arg("width"), py::arg("height"),
+           py::arg("format") = ImageFormat::YUV420SP_VU,
+           py::arg("vb_buffer_num") = 3)
+      .def("read", &PyCamera::read, py::arg("channel") = 0,
+           "Capture one frame from the camera and return it as an Image")
+      .def("release", &PyCamera::release, py::arg("channel") = 0,
+           "Release the frame buffer back to the VB pool")
+      .def("close", &PyCamera::close, "Stop the camera and free resources")
+      .def("__enter__", &PyCamera::enter, py::return_value_policy::reference)
+      .def("__exit__", &PyCamera::exit);
+
+  // RTSP streaming server
+  py::class_<PyRTSP>(image, "RTSPServer")
+      .def(py::init<int32_t, int32_t, int32_t, const std::string&,
+                    const std::string&>(),
+           py::arg("width"), py::arg("height"), py::arg("chn") = 0,
+           py::arg("codec") = "h264", py::arg("session_name") = "",
+           "Create an RTSP server.  Access stream at rtsp://<ip>:554/<session_name>.\n"
+           "codec: 'h264' (default) or 'h265'.\n"
+           "session_name: URL path (defaults to codec name).")
+      .def("send_frame", &PyRTSP::sendFrame, py::arg("frame"),
+           "Encode and send a hardware camera frame over RTSP.\n"
+           "frame must be a VPSSImage obtained from Camera.read().")
+      .def("get_session_name", &PyRTSP::getSessionName,
+           "Return the URL path component, e.g. 'h264'.")
+      .def("__enter__", &PyRTSP::enter, py::return_value_policy::reference)
+      .def("__exit__", &PyRTSP::exit);
+
+  // Draw utilities (operate in-place on hardware camera frames)
+  image.def("draw_bbox", &drawBbox,
+            py::arg("frame"), py::arg("x1"), py::arg("y1"),
+            py::arg("x2"), py::arg("y2"),
+            py::arg("color") = py::make_tuple(0, 255, 0),
+            py::arg("thickness") = 2,
+            "Draw a bounding box on a hardware frame.  color=(R,G,B).");
+
+  image.def("draw_text", &drawText,
+            py::arg("frame"), py::arg("text"), py::arg("x"), py::arg("y"),
+            py::arg("color") = py::make_tuple(0, 255, 0),
+            py::arg("scale") = 0.5,
+            "Draw a text string on a hardware frame.  color=(R,G,B).");
+
+  image.def("draw_detections", &drawDetections,
+            py::arg("frame"), py::arg("detections"),
+            py::arg("score_threshold") = 0.0f,
+            "Draw bounding boxes and labels for all detections on a hardware frame.\n"
+            "'detections' is the list returned by Model.inference().");
+
+  image.def("draw_keypoints", &drawKeypoints,
+            py::arg("frame"), py::arg("detections"),
+            py::arg("score_threshold") = 0.0f,
+            "Draw keypoints and skeleton lines on a hardware frame.\n"
+            "Uses COCO-17 skeleton when 17 keypoints are detected.");
+
+  image.def("frame_to_jpeg", &frameToJpeg,
+            py::arg("frame"), py::arg("quality") = 80, py::arg("scale") = 1.0f,
+            "Convert a hardware camera frame (VPSSImage) to JPEG bytes.\n"
+            "quality: 0-100 JPEG quality (default 80).\n"
+            "scale: downscale factor 0<s<1 before encoding (e.g. 0.5 = half size,\n"
+            "  4× fewer pixels, much faster encode). Default 1.0 = full resolution.\n"
+            "Call after draw_detections/draw_keypoints, before cam.release().\n"
+            "Returns bytes suitable for base64-encoding or HTTP delivery.");
+
   // 神经网络模块
   py::module nn = m.def_submodule("nn", "Neural network algorithms module");
   py::enum_<ModelType> model_type_enum(nn, "ModelType");
@@ -96,17 +166,92 @@ PYBIND11_MODULE(tdl, m) {
   model_type_enum.export_values();
 
   py::class_<PyModel>(nn, "Model")
-      .def("getPreprocessParameters", &PyModel::getPreprocessParameters)
-      .def("inference", py::overload_cast<const PyImage&>(&PyModel::inference))
+      .def("get_preprocess_parameters", &PyModel::getPreprocessParameters)
+      .def("inference", py::overload_cast<const PyImage&>(&PyModel::inference),
+           py::arg("image"))
       .def("inference",
-           py::overload_cast<
-               const py::array_t<unsigned char, py::array::c_style>&>(
-               &PyModel::inference));
+           py::overload_cast<const py::array_t<unsigned char,
+                                               py::array::c_style>&>(
+               &PyModel::inference),
+           py::arg("array"))
+      .def("inference",
+           py::overload_cast<const PyImage&, const py::dict&>(
+               &PyModel::inference),
+           py::arg("image"), py::arg("parameters"),
+           "Run inference with extra runtime parameters (e.g. score threshold)")
+      .def("set_threshold", &PyModel::setThreshold, py::arg("threshold"))
+      .def("get_threshold", &PyModel::getThreshold)
+      .def("get_input_names", &PyModel::getInputNames)
+      .def("get_output_names", &PyModel::getOutputNames);
+
   nn.def("get_model", get_model_with_path, py::arg("model_type"),
          py::arg("model_path"), py::arg("model_config") = py::dict(),
          py::arg("device_id") = 0);
   nn.def("get_model_from_dir", get_model_with_dir, py::arg("model_type"),
          py::arg("model_dir") = "", py::arg("device_id") = 0);
+
+  // Tracker
+  py::enum_<TDLObjectType>(nn, "ObjectType")
+      .value("UNDEFINED", OBJECT_TYPE_UNDEFINED)
+      .value("PERSON", OBJECT_TYPE_PERSON)
+      .value("FACE", OBJECT_TYPE_FACE)
+      .value("HAND", OBJECT_TYPE_HAND)
+      .value("HEAD", OBJECT_TYPE_HEAD)
+      .value("HEAD_SHOULDER", OBJECT_TYPE_HEAD_SHOULDER)
+      .value("HARD_HAT", OBJECT_TYPE_HARD_HAT)
+      .value("FACE_MASK", OBJECT_TYPE_FACE_MASK)
+      .value("CAR", OBJECT_TYPE_CAR)
+      .value("BUS", OBJECT_TYPE_BUS)
+      .value("TRUCK", OBJECT_TYPE_TRUCK)
+      .value("MOTORBIKE", OBJECT_TYPE_MOTORBIKE)
+      .value("BICYCLE", OBJECT_TYPE_BICYCLE)
+      .value("LICENSE_PLATE", OBJECT_TYPE_LICENSE_PLATE)
+      .value("FIRE", OBJECT_TYPE_FIRE)
+      .value("SMOKE", OBJECT_TYPE_SMOKE)
+      .export_values();
+
+  py::enum_<TrackerType>(nn, "TrackerType")
+      .value("MOT_SORT", TrackerType::TDL_MOT_SORT)
+      .value("SOT", TrackerType::TDL_SOT)
+      .export_values();
+
+  py::class_<TrackerConfig>(nn, "TrackerConfig")
+      .def(py::init<>())
+      .def_readwrite("max_unmatched_times", &TrackerConfig::max_unmatched_times_)
+      .def_readwrite("track_confirmed_frames",
+                     &TrackerConfig::track_confirmed_frames_)
+      .def_readwrite("track_init_score_thresh",
+                     &TrackerConfig::track_init_score_thresh_)
+      .def_readwrite("high_score_thresh", &TrackerConfig::high_score_thresh_)
+      .def_readwrite("high_score_iou_dist_thresh",
+                     &TrackerConfig::high_score_iou_dist_thresh_)
+      .def_readwrite("low_score_iou_dist_thresh",
+                     &TrackerConfig::low_score_iou_dist_thresh_);
+
+  py::class_<PyTracker>(nn, "Tracker")
+      .def(py::init<TrackerType>(), py::arg("type") = TrackerType::TDL_MOT_SORT)
+      .def("set_img_size", &PyTracker::setImgSize, py::arg("width"),
+           py::arg("height"))
+      .def("set_track_config", &PyTracker::setTrackConfig, py::arg("config"))
+      .def("get_track_config", &PyTracker::getTrackConfig)
+      .def("set_pair_config", &PyTracker::setPairConfig, py::arg("pair_map"),
+           "Map of ObjectType pairs for linked tracking")
+      .def("track", &PyTracker::track, py::arg("boxes"), py::arg("frame_id"),
+           "Update tracker with detection boxes. Returns list of track dicts.");
+
+  // Matcher
+  py::class_<PyMatcher>(nn, "Matcher")
+      .def(py::init<std::string>(), py::arg("matcher_type"),
+           "Create a matcher. matcher_type: 'cosine' or 'euclidean'")
+      .def("load_gallery", &PyMatcher::loadGallery, py::arg("features"),
+           "Load gallery from list of numpy arrays (float32 / int8 / uint8)")
+      .def("query", &PyMatcher::queryWithTopK, py::arg("features"),
+           py::arg("topk") = 1,
+           "Query top-k matches. Returns (indices, scores) tuple.")
+      .def("update_gallery", &PyMatcher::updateGallery, py::arg("features"),
+           py::arg("col"), "Update a single gallery column")
+      .def("get_gallery_size", &PyMatcher::getGalleryFeatureNum)
+      .def("get_feature_dim", &PyMatcher::getFeatureDim);
   /*
   py::module llm = m.def_submodule("llm", "LLM module");
   llm.def("fetch_video", &pytdl::fetch_video, py::arg("video_path"),

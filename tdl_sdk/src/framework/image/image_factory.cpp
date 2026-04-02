@@ -177,7 +177,9 @@ int32_t ImageFactory::writeImage(const std::string& file_path,
       image_format != ImageFormat::RGB_PACKED &&
       image_format != ImageFormat::GRAY &&
       image_format != ImageFormat::RGB_PLANAR &&
-      image_format != ImageFormat::BGR_PLANAR) {
+      image_format != ImageFormat::BGR_PLANAR &&
+      image_format != ImageFormat::YUV420SP_UV &&
+      image_format != ImageFormat::YUV420SP_VU) {
     LOGE("Image format is not supported,format:%d",
          static_cast<int>(image_format));
     return -1;
@@ -219,6 +221,29 @@ int32_t ImageFactory::writeImage(const std::string& file_path,
       cv::merge(channels, img);
     }
     cv::imwrite(file_path, img);
+  } else if (image_format == ImageFormat::YUV420SP_UV ||
+             image_format == ImageFormat::YUV420SP_VU) {
+    // Build a contiguous YUV420SP buffer (Y plane + interleaved UV/VU plane)
+    // then let OpenCV convert to BGR for saving.
+    int h = image->getHeight();
+    int w = image->getWidth();
+    cv::Mat yuv_mat(h * 3 / 2, w, CV_8UC1);
+    // Copy Y plane (may have stride padding)
+    uint8_t* y_src = reinterpret_cast<uint8_t*>(image->getVirtualAddress()[0]);
+    int y_stride   = image->getStrides()[0];
+    for (int row = 0; row < h; row++)
+      memcpy(yuv_mat.data + row * w, y_src + row * y_stride, w);
+    // Copy interleaved UV/VU plane (h/2 rows, stride may differ)
+    uint8_t* uv_src = reinterpret_cast<uint8_t*>(image->getVirtualAddress()[1]);
+    int uv_stride   = image->getStrides()[1];
+    for (int row = 0; row < h / 2; row++)
+      memcpy(yuv_mat.data + h * w + row * w, uv_src + row * uv_stride, w);
+    cv::Mat bgr_mat;
+    int cvt_code = (image_format == ImageFormat::YUV420SP_VU)
+                       ? cv::COLOR_YUV2BGR_NV21   // NV21: VU interleaved
+                       : cv::COLOR_YUV2BGR_NV12;  // NV12: UV interleaved
+    cv::cvtColor(yuv_mat, bgr_mat, cvt_code);
+    cv::imwrite(file_path, bgr_mat);
   }
   LOGI(
       "write image to "

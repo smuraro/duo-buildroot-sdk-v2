@@ -122,8 +122,11 @@ int32_t BaseModel::setPreprocessParameters(const PreprocessParams& pre_param,
     preprocess_params.mean[i] *= tensor_info.qscale;
     preprocess_params.scale[i] *= tensor_info.qscale;
   }
-  preprocess_params.dst_height = tensor_info.shape[2];
-  preprocess_params.dst_width = tensor_info.shape[3];
+  {
+    const bool is_nhwc = (tensor_info.shape[3] == 1 || tensor_info.shape[3] == 3);
+    preprocess_params.dst_height = is_nhwc ? tensor_info.shape[1] : tensor_info.shape[2];
+    preprocess_params.dst_width  = is_nhwc ? tensor_info.shape[2] : tensor_info.shape[3];
+  }
   preprocess_params.dst_pixdata_type = tensor_info.data_type;
   LOGI(
       "input_name:%s,qscale:%f,mean:%f,%f,%f,scale:%f,%f,%f,dst_height:%"
@@ -161,10 +164,21 @@ int32_t BaseModel::setupNetwork(NetParam& net_param) {
       return -1;
     }
     preprocess_param.keep_aspect_ratio = keep_aspect_ratio_;
+
+    // Detect NHWC [N,H,W,C] vs NCHW [N,C,H,W].
+    // Heuristic: last dim == 1 or 3 → channel count → NHWC.
+    // sscma/YOLO11 cvimodels use NHWC; standard TDL cvimodels use NCHW.
+    const bool is_nhwc = (tensor_info.shape[3] == 1 || tensor_info.shape[3] == 3);
+
     if (net_param_.model_config.rgb_order == "rgb") {
-      preprocess_param.dst_image_format = ImageFormat::RGB_PLANAR;
+      // NHWC layout is packed (H×W×C); NCHW is planar (C×H×W).
+      // VPSS on CV181X supports PIXEL_FORMAT_RGB_888 (packed) but NOT
+      // PIXEL_FORMAT_RGB_888_PLANAR when the dst type is INT8.
+      preprocess_param.dst_image_format =
+          is_nhwc ? ImageFormat::RGB_PACKED : ImageFormat::RGB_PLANAR;
     } else if (net_param_.model_config.rgb_order == "bgr") {
-      preprocess_param.dst_image_format = ImageFormat::BGR_PLANAR;
+      preprocess_param.dst_image_format =
+          is_nhwc ? ImageFormat::BGR_PACKED : ImageFormat::BGR_PLANAR;
     } else if (net_param_.model_config.rgb_order == "gray") {
       preprocess_param.dst_image_format = ImageFormat::GRAY;
     } else {
@@ -184,9 +198,16 @@ int32_t BaseModel::setupNetwork(NetParam& net_param) {
           std::min(preprocess_param.scale[i],
                    8191.0f / 8192);  // fix vpss scale overflow warning
     }
-    preprocess_param.dst_height = tensor_info.shape[2];
-    preprocess_param.dst_width = tensor_info.shape[3];
+    // For NHWC [N,H,W,C]: H=shape[1], W=shape[2]
+    // For NCHW [N,C,H,W]: H=shape[2], W=shape[3]
+    preprocess_param.dst_height = is_nhwc ? tensor_info.shape[1] : tensor_info.shape[2];
+    preprocess_param.dst_width  = is_nhwc ? tensor_info.shape[2] : tensor_info.shape[3];
     preprocess_param.dst_pixdata_type = tensor_info.data_type;
+    if (is_nhwc) {
+      LOGI("input tensor NHWC detected: dst=%dx%d fmt=%d",
+           preprocess_param.dst_width, preprocess_param.dst_height,
+           (int)preprocess_param.dst_image_format);
+    }
     LOGI(
         "input_name:%s,qscale:%f,mean:%f,%f,%f,scale:%f,%f,%f,dst_height:%"
         "d,"
@@ -253,6 +274,7 @@ int32_t BaseModel::inference(
         preprocessor_->preprocessToTensor(
             images[process_idx + i], preprocess_params, i,
             net_->getInputTensor(input_layer_name));
+        postPreprocess(net_->getInputTensor(input_layer_name), i);
         std::vector<float> rescale_params = preprocessor_->getRescaleConfig(
             preprocess_params, images[process_idx + i]->getWidth(),
             images[process_idx + i]->getHeight());
@@ -408,6 +430,11 @@ int32_t BaseModel::outputParse(
 void BaseModel::setTypeMapping(
     const std::map<int, TDLObjectType>& type_mapping) {
   type_mapping_ = type_mapping;
+}
+
+void BaseModel::setClassNameMap(
+    const std::map<int, std::string>& class_name_map) {
+  class_name_map_ = class_name_map;
 }
 void BaseModel::setModelThreshold(float threshold) {
   model_threshold_ = threshold;

@@ -17,13 +17,18 @@ class PyModel {
   PyModel(std::shared_ptr<BaseModel>& model);
 
   py::list inference(const PyImage& image);
-
   py::list inference(
       const py::array_t<unsigned char, py::array::c_style>& input);
+  py::list inference(const PyImage& image, const py::dict& parameters);
 
   virtual ~PyModel() = default;
 
   py::dict getPreprocessParameters();
+
+  void setThreshold(float threshold);
+  float getThreshold() const;
+  std::vector<std::string> getInputNames() const;
+  std::vector<std::string> getOutputNames() const;
 
  protected:
   std::shared_ptr<BaseModel> model_;

@@ -5,6 +5,7 @@
 #include <cassert>
 // #include "core/utils/vpss_helper.h"
 #include "cvi_comm_vb.h"
+#include "cvi_sys.h"
 #include "image/vpss_image.hpp"
 #include "utils/frame_dump.hpp"
 #include "utils/tdl_log.hpp"
@@ -34,6 +35,7 @@ VpssContext::VpssContext() {
 
     LOGI("CVI_VB_Init success");
   }
+
 #endif
 
   s32Ret = CVI_SYS_Init();
@@ -41,6 +43,27 @@ VpssContext::VpssContext() {
     LOGE("CVI_SYS_Init failed!\n");
     assert(false);
   }
+
+#if defined(__CV181X__) || defined(__CV180X__)
+  // Set VPSS_MODE_DUAL after CVI_SYS_Init so that ISP-connected groups
+  // (device 1) are available for camera use even when models load first.
+  // CVI_SYS_Init resets modes to defaults on first call, so we must set
+  // DUAL mode afterwards. VPSS device 0 (MEM input) still works in DUAL mode.
+  {
+    VI_VPSS_MODE_S stVIVPSSMode;
+    for (int i = 0; i < VI_MAX_PIPE_NUM; ++i)
+      stVIVPSSMode.aenMode[i] = VI_OFFLINE_VPSS_ONLINE;
+    CVI_SYS_SetVIVPSSMode(&stVIVPSSMode);
+
+    VPSS_MODE_S stVPSSMode;
+    memset(&stVPSSMode, 0, sizeof(VPSS_MODE_S));
+    stVPSSMode.enMode = VPSS_MODE_DUAL;
+    stVPSSMode.aenInput[0] = VPSS_INPUT_MEM;
+    stVPSSMode.aenInput[1] = VPSS_INPUT_ISP;
+    stVPSSMode.ViPipe[0] = 0;
+    CVI_SYS_SetVPSSModeEx(&stVPSSMode);
+  }
+#endif
 
 #if defined(__CV184X__) || defined(__CV181X__) || defined(__CV180X__)
   s32Ret = CVI_VB_Init();
@@ -231,7 +254,9 @@ int32_t VpssPreprocessor::prepareVPSSParams(
     LOGE("CVI_VPSS_SetChnCrop failed with %#x\n", ret);
     return -1;
   }
-  ret = CVI_VPSS_SetChnScaleCoefLevel(group_id_, 0, VPSS_SCALE_COEF_BILINEAR);
+  VPSS_SCALE_COEF_E scale_coef =
+      params.use_nearest_resize ? VPSS_SCALE_COEF_NEAREST : VPSS_SCALE_COEF_BILINEAR;
+  ret = CVI_VPSS_SetChnScaleCoefLevel(group_id_, 0, scale_coef);
   if (ret != CVI_SUCCESS) {
     LOGE("CVI_VPSS_SetChnScaleCoefLevel failed with %#x\n", ret);
     return -1;
