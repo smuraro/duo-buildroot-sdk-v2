@@ -22,3 +22,4 @@ ncscope.*
 
 __pycache__
 .vscode
+.claude/
