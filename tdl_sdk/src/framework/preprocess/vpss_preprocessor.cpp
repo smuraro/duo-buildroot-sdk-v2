@@ -443,17 +443,49 @@ int32_t VpssPreprocessor::preprocessToImage(
   VPSSImage* vpss_image = static_cast<VPSSImage*>(image.get());
   vpss_image->checkToSwapRGB();
 
+  // Helper lambda: disable/stop/reset/restart the VPSS group to clear a stuck
+  // waitq.  Used in error recovery paths below.
+  auto recoverGroup = [this]() {
+    LOGE("[VpssPreprocessor] recovering VPSS group %d (disable→stop→reset→start)\n",
+         group_id_);
+    CVI_VPSS_DisableChn(group_id_, 0);
+    CVI_VPSS_StopGrp(group_id_);
+    CVI_VPSS_ResetGrp(group_id_);
+    VPSS_CHN_ATTR_S chn_attr;
+    init_vpss_chn_attr(&chn_attr, 100, 100, PIXEL_FORMAT_RGB_888_PLANAR,
+                       CVI_TRUE);
+    CVI_VPSS_SetChnAttr(group_id_, 0, &chn_attr);
+    CVI_VPSS_EnableChn(group_id_, 0);
+    CVI_VPSS_StartGrp(group_id_);
+    vpss_params_valid_ = false;  // force full reconfiguration on next frame
+  };
+
   // prepare output frame
   LOGI("to CVI_VPSS_SendChnFrame");
   ret = CVI_VPSS_SendChnFrame(group_id_, 0, output_frame, -1);
   if (ret != CVI_SUCCESS) {
-    LOGE("CVI_VPSS_SendChnFrame failed with %#x\n", ret);
-    return ret;
+    // The waitq is full — a previous SendFrame failure left output frames
+    // stuck in the queue without a matching GetChnFrame to drain them.
+    // Recover by restarting the group, then retry once.
+    LOGE("CVI_VPSS_SendChnFrame failed with %#x (waitq full) — recovering\n",
+         ret);
+    recoverGroup();
+    ret = CVI_VPSS_SendChnFrame(group_id_, 0, output_frame, -1);
+    if (ret != CVI_SUCCESS) {
+      LOGE("CVI_VPSS_SendChnFrame still failed after recovery: %#x\n", ret);
+      return ret;
+    }
   }
   LOGI("to CVI_VPSS_SendFrame");
   ret = CVI_VPSS_SendFrame(group_id_, input_frame, -1);
   if (ret != CVI_SUCCESS) {
-    LOGE("CVI_VPSS_SendFrame failed with %#x\n", ret);
+    // output_frame is now stuck in the waitq (SendChnFrame succeeded but
+    // SendFrame failed, so GetChnFrame will never be called for it).
+    // Reset the group immediately to prevent the waitq from filling up on
+    // subsequent calls.
+    LOGE("CVI_VPSS_SendFrame failed with %#x — recovering to prevent queue leak\n",
+         ret);
+    recoverGroup();
     return ret;
   }
   LOGI("to CVI_VPSS_GetChnFrame");

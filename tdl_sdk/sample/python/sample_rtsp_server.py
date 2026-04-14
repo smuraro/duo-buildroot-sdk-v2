@@ -197,13 +197,22 @@ def parse_args():
     return p.parse_args()
 
 
-# ─── Thread de inferência ─────────────────────────────────────────────────────
+# ─── Thread de inferência / release ──────────────────────────────────────────
 #
-# Consome frames da fila _infer_queue, corre a inferência e publica os
-# resultados em _last_detections (protegido por _det_lock).
+# Todos os frames lidos passam pela _release_queue antes de serem devolvidos
+# à câmera.  A thread processa-os em ordem FIFO: corre inferência nos marcados
+# com do_infer=True, depois chama sempre cam.release().
+#
+# Por que isso é necessário:
+#   ViDecoder::release() usa uma fila interna (frameQueues) e devolve sempre o
+#   frame mais antigo — se o main thread chamasse cam.release() para o frame N+1
+#   enquanto a thread de inferência ainda usa o frame N, a liberação cairia sobre
+#   o VB block errado → "vb released" no VPSS do preprocessador.
+#
+# Regra: cam.release() só é chamado dentro desta thread, garantindo ordem FIFO.
 
-_infer_queue        = []       # lista de (frame, release_fn)
-_infer_lock         = threading.Lock()
+_release_queue      = []       # lista de (frame, do_infer: bool)
+_release_lock       = threading.Lock()
 _last_detections    = []
 _det_lock           = threading.Lock()
 _infer_fps          = 0.0
@@ -212,36 +221,56 @@ _persist_detections = False   # configurado em main() via args.persist_detection
 _last_detect_frame  = -1      # frame_idx da última inferência positiva
 _frame_count        = 0       # frame atual (atualizado pelo loop principal)
 
+# Máximo de frames aguardando na fila de release.  Se a fila encher (inferência
+# mais lenta que a câmera), novos frames entram com do_infer=False para não
+# acumular mais de MAX_RELEASE_PENDING VB blocks além do que está em inferência.
+_MAX_RELEASE_PENDING = 2
 
-def _inference_worker(detector, threshold):
+# Pool de VB blocks da câmera.  Com inferência assíncrona, o main thread e
+# a thread de inferência seguram frames simultaneamente.  O semáforo impede
+# que cam.read() avance quando todos os blocks estão ocupados, evitando o
+# stall do ISP (erro "jobs wait(0) work(0) done(0)").
+#
+#   _VB_BUFFER_NUM  = tamanho do pool criado no driver (passado ao Camera())
+#   _vb_sem inicial = _VB_BUFFER_NUM - 2
+#     (reserva 1 block para o VPSS output interno + 1 de folga)
+_VB_BUFFER_NUM = 5
+_vb_sem        = threading.Semaphore(_VB_BUFFER_NUM - 2)
+
+
+def _inference_worker(detector, cam, threshold):
     global _running, _infer_fps, _infer_ms, _last_detect_frame
-    t0      = time.time()
-    count   = 0
+    t0    = time.time()
+    count = 0
     while _running:
         item = None
-        with _infer_lock:
-            if _infer_queue:
-                item = _infer_queue.pop(0)
+        with _release_lock:
+            if _release_queue:
+                item = _release_queue.pop(0)
 
         if item is None:
             time.sleep(0.001)
             continue
 
-        frame, release_fn = item
-        ti = time.time()
-        dets = detector.inference(frame)
-        _infer_ms = (time.time() - ti) * 1000
-        release_fn()   # libera o VB block após a inferência ter terminado
+        frame, do_infer = item
+        if do_infer:
+            ti   = time.time()
+            dets = detector.inference(frame)
+            _infer_ms = (time.time() - ti) * 1000
 
-        with _det_lock:
-            _last_detections[:] = dets
-            if dets:
-                _last_detect_frame = _frame_count
+            with _det_lock:
+                _last_detections[:] = dets
+                if dets:
+                    _last_detect_frame = _frame_count
 
-        count += 1
-        elapsed = time.time() - t0
-        if elapsed > 0:
-            _infer_fps = count / elapsed
+            count += 1
+            elapsed = time.time() - t0
+            if elapsed > 0:
+                _infer_fps = count / elapsed
+
+        # Sempre libera em ordem FIFO — nunca o main thread chama cam.release()
+        cam.release()
+        _vb_sem.release()   # libera um slot do pool para o main thread
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -286,14 +315,15 @@ def main():
     # --- Câmera ---
     print(f"\nAbrindo câmera {args.width}x{args.height} ...")
     cam = image.Camera(args.width, args.height, image.ImageFormat.YUV420SP_VU,
+                       vb_buffer_num=_VB_BUFFER_NUM,
                        mirror=args.mirror, flip=args.flip)
 
-    # --- Thread de inferência ---
+    # --- Thread de inferência / release ---
     global _persist_detections
     _persist_detections = args.persist_detections
     infer_thread = threading.Thread(
         target=_inference_worker,
-        args=(detector, args.threshold),
+        args=(detector, cam, args.threshold),
         daemon=True,
     )
     infer_thread.start()
@@ -318,23 +348,14 @@ def main():
 
     try:
         while _running and (limit is None or frame_idx < limit):
+            # Aguarda um slot livre no pool de VB blocks antes de ler o próximo
+            # frame.  Sem isso, se a inferência demorar mais que um ciclo de
+            # câmera, o pool esgota-se e o ISP para de produzir frames.
+            if not _vb_sem.acquire(timeout=0.5):
+                continue   # timeout — verifica _running e tenta de novo
             t0 = time.time()
             frame = cam.read()
             cam_ms = (time.time() - t0) * 1000
-
-            # Envia para inferência (sem bloquear): descarta frames antigos da fila
-            # A thread de inferência é responsável por chamar release_fn() em cada
-            # frame que consome; o loop principal não deve chamar cam.release() para
-            # frames que foram para a fila.
-            sent_to_infer = False
-            if frame_idx % skip_every == 0:
-                with _infer_lock:
-                    # Devolve frames descartados antes de enfileirar o novo
-                    while _infer_queue:
-                        _, old_release = _infer_queue.pop(0)
-                        old_release()
-                    _infer_queue.append((frame, cam.release))
-                    sent_to_infer = True
 
             # Lê últimas detecções e desenha overlay
             with _det_lock:
@@ -356,8 +377,17 @@ def main():
             rtsp.send_frame(frame)
             send_ms = (time.time() - t2) * 1000
 
-            if not sent_to_infer:
-                cam.release()
+            # Todos os frames passam pela _release_queue.
+            # A thread de inferência chama cam.release() em ordem FIFO para
+            # todos eles, garantindo que o VB block do frame N nunca seja
+            # libertado antes de o frame N-1 ter sido processado.
+            # Se a fila já está cheia, desativa a inferência neste frame para
+            # evitar acumulação de VB blocks (pool de 4 blocos típico).
+            do_infer = (frame_idx % skip_every == 0)
+            with _release_lock:
+                if len(_release_queue) >= _MAX_RELEASE_PENDING:
+                    do_infer = False
+                _release_queue.append((frame, do_infer))
             frame_idx += 1
             _frame_count = frame_idx
 
@@ -388,11 +418,12 @@ def main():
         print(f"\n[ERRO] {exc}")
     finally:
         _running = False
+        _vb_sem.release()   # desbloqueia acquire() caso esteja esperando
         infer_thread.join(timeout=2.0)
-        with _infer_lock:
-            while _infer_queue:
-                _, old_release = _infer_queue.pop(0)
-                old_release()
+        # Descarta frames pendentes na fila; cam.close() libera o frameQueues
+        # interno do ViDecoder, então não é preciso chamar cam.release() aqui.
+        with _release_lock:
+            _release_queue.clear()
         detector.close()
         cam.close()
         del rtsp
