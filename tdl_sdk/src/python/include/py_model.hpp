@@ -20,6 +20,8 @@ class PyModel {
   py::list inference(
       const py::array_t<unsigned char, py::array::c_style>& input);
   py::list inference(const PyImage& image, const py::dict& parameters);
+  py::list inferenceWithDetections(const PyImage& image,
+                                   const py::list& det_list);
 
   virtual ~PyModel() = default;
 

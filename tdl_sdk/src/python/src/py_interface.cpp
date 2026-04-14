@@ -295,7 +295,16 @@ PYBIND11_MODULE(tdl, m) {
            "stronger suppression.")
       .def("get_soft_nms", &PyModel::getSoftNms)
       .def("get_input_names", &PyModel::getInputNames)
-      .def("get_output_names", &PyModel::getOutputNames);
+      .def("get_output_names", &PyModel::getOutputNames)
+      .def("inference_with_detections",
+           &PyModel::inferenceWithDetections,
+           py::arg("image"), py::arg("detections"),
+           "Two-stage inference: runs the model on each face region supplied by\n"
+           "'detections' (list of dicts with x1,y1,x2,y2 from a face detector).\n"
+           "Returns a list of dicts in OBJECT_DETECTION_WITH_LANDMARKS format —\n"
+           "one entry per detected face — so draw_detections + draw_keypoints\n"
+           "both work automatically.  Landmark coordinates are remapped to\n"
+           "full-frame pixel space.");
 
   nn.def("get_model", get_model_with_path, py::arg("model_type"),
          py::arg("model_path"), py::arg("model_config") = py::dict(),

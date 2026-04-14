@@ -20,6 +20,14 @@ Uso:
         [--labels "classe0,classe1"] \\
         [--mirror] [--flip]
 
+Pipeline dois estágios (ex: SCRFD → KEYPOINT_FACE_V2):
+    python3 sample_rtsp_webserver.py \\
+        --model /root/cv181x/keypoint_face_v2_64_64_INT8_cv181x.cvimodel \\
+        --model-type KEYPOINT_FACE_V2 \\
+        --stage1-model /root/cv181x/scrfd_det_face_432_768_INT8_cv181x.cvimodel \\
+        --stage1-model-type SCRFD_DET_FACE
+O detector facial (Stage-1) também pode ser configurado na interface web em tempo real.
+
 Acesso:
     http://<ip-do-dispositivo>:9000/
 Stream RTSP direto (VLC/ffplay):
@@ -213,6 +221,13 @@ _current_model_type = ""         # model type name string (e.g. "SCRFD_DET_FACE"
 _current_threshold  = 0.5
 _switch_status      = ""         # last switch result message
 
+# Stage-1 detector (face detector for two-stage pipelines, e.g. KEYPOINT_FACE_V2).
+# Protected by _detector_lock — never accessed outside that lock in the
+# inference worker so no separate lock is needed.
+_stage1_detector    = None
+_stage1_model_type  = ""
+_stage1_switch_status = ""
+
 _FACTORY_JSON_PATH = "/mnt/system/configs/model/model_factory.json"
 _CVIMODEL_SEARCH_DIRS = ["/root", "/root/cv181x", "/mnt", "/mnt/data"]
 
@@ -264,17 +279,26 @@ def _inference_worker(cam, vb_sem):
 
         frame, do_infer = item
         if do_infer:
-            # Mantém _detector_lock durante toda a inferência.
-            # _do_switch_model também usa _detector_lock para trocar o modelo e
-            # depois chama old.close().  Como old.close() fica FORA do lock,
-            # ele só é executado depois que este bloco terminar — garantindo que
-            # o NPU runtime nunca é liberado enquanto inference() o está a usar.
+            # Mantém _detector_lock durante toda a inferência (stage1 + stage2).
+            # _do_switch_model/_do_switch_stage1 chamam old.close() FORA do lock,
+            # então só executam depois que este bloco terminar — garantindo que o
+            # NPU runtime nunca é liberado enquanto inference() o está a usar.
             with _detector_lock:
-                det = _detector
+                det    = _detector
+                stage1 = _stage1_detector
                 if det is not None:
                     try:
-                        ti   = time.time()
-                        dets = det.inference(frame)
+                        ti = time.time()
+                        mt = _current_model_type.upper()
+                        use_two_stage = (stage1 is not None and
+                                         ("KEYPOINT" in mt or "LANDMARK" in mt))
+                        if use_two_stage:
+                            # Pipeline dois estágios: faces → landmarks
+                            faces = stage1.inference(frame)
+                            dets  = det.inference_with_detections(frame, faces) \
+                                    if faces else []
+                        else:
+                            dets = det.inference(frame)
                         _infer_ms = (time.time() - ti) * 1000
                         with _det_lock:
                             _last_detections[:] = dets
@@ -392,6 +416,61 @@ def _do_switch_model(model_type_name: str, model_path: str) -> tuple:
     msg = f"Modelo trocado: {model_type_name} / {os.path.basename(model_path)}"
     _switch_status = msg
     print(f"[switch] {msg}")
+    return True, msg
+
+
+def _do_switch_stage1(model_type_name: str, model_path: str) -> tuple:
+    """Load (or clear) the stage-1 face detector used in two-stage pipelines.
+
+    Pass empty strings for both arguments to disable the stage-1 detector.
+    Returns (ok: bool, message: str).
+    """
+    global _stage1_detector, _stage1_model_type, _stage1_switch_status
+
+    if not model_type_name and not model_path:
+        # Clear stage-1
+        with _detector_lock:
+            old = _stage1_detector
+            _stage1_detector   = None
+            _stage1_model_type = ""
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        _stage1_switch_status = "Stage-1 desativado"
+        print("[switch_stage1] desativado")
+        return True, _stage1_switch_status
+
+    model_type = getattr(nn.ModelType, model_type_name, None)
+    if model_type is None:
+        return False, f"Stage-1 ModelType desconhecido: {model_type_name}"
+    if not os.path.isfile(model_path):
+        return False, f"Stage-1 arquivo não encontrado: {model_path}"
+
+    try:
+        new_det = nn.get_model(model_type, model_path)
+        new_det.set_threshold(_current_threshold)
+    except Exception as e:
+        return False, f"Erro ao carregar stage-1: {e}"
+
+    with _detector_lock:
+        old                = _stage1_detector
+        _stage1_detector   = new_det
+        _stage1_model_type = model_type_name
+
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+
+    with _det_lock:
+        _last_detections.clear()
+
+    msg = f"Stage-1 trocado: {model_type_name} / {os.path.basename(model_path)}"
+    _stage1_switch_status = msg
+    print(f"[switch_stage1] {msg}")
     return True, msg
 
 
@@ -813,6 +892,23 @@ HTML_PAGE = """\
         <div id="switch-msg" style="font-family:var(--mono);font-size:10px;color:var(--dim);min-height:14px"></div>
       </div>
     </div>
+
+    <div class="section">
+      <div class="section-title" title="Detector facial para modelos de dois estágios (ex: KEYPOINT_FACE_V2)">Detector Facial (Stage-1)</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <select id="sel-s1-type" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:5px 6px;font-family:var(--mono);font-size:11px;border-radius:3px">
+          <option value="">-- desativar stage-1 --</option>
+        </select>
+        <select id="sel-s1-file" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:5px 6px;font-family:var(--mono);font-size:11px;border-radius:3px">
+          <option value="">-- cvimodel --</option>
+        </select>
+        <button id="btn-s1-switch" onclick="doSwitchStage1()"
+          style="background:var(--accent2);color:#000;border:none;padding:7px;font-family:var(--mono);font-size:11px;font-weight:700;border-radius:3px;cursor:pointer;letter-spacing:.1em">
+          APLICAR
+        </button>
+        <div id="s1-switch-msg" style="font-family:var(--mono);font-size:10px;color:var(--dim);min-height:14px"></div>
+      </div>
+    </div>
   </aside>
 </main>
 
@@ -1096,6 +1192,82 @@ async function doSwitch() {
 }
 
 loadModelSelector();
+
+// ─── Stage-1 (face detector) selector ────────────────────────────────────────
+
+async function loadS1Selector() {
+  try {
+    const types = await fetch('/api/models').then(r => r.json());
+    const selType = document.getElementById('sel-s1-type');
+    types.forEach(t => {
+      const o = document.createElement('option');
+      o.value = o.textContent = t;
+      selType.appendChild(o);
+    });
+    selType.onchange = () => onS1TypeChange(selType.value);
+  } catch(e) {}
+}
+
+async function onS1TypeChange(modelType) {
+  const selFile = document.getElementById('sel-s1-file');
+  if (!modelType) {
+    selFile.innerHTML = '<option value="">-- cvimodel --</option>';
+    return;
+  }
+  selFile.innerHTML = '<option value="">Buscando...</option>';
+  try {
+    const files = await fetch('/api/cvimodels?type=' + encodeURIComponent(modelType))
+                    .then(r => r.json());
+    selFile.innerHTML = '<option value="">-- cvimodel --</option>';
+    files.forEach(f => {
+      const o = document.createElement('option');
+      o.value = f;
+      o.textContent = f.split('/').pop();
+      o.title = f;
+      selFile.appendChild(o);
+    });
+    if (files.length === 1) selFile.value = files[0];
+  } catch(e) {
+    selFile.innerHTML = '<option value="">Erro</option>';
+  }
+}
+
+async function doSwitchStage1() {
+  const modelType = document.getElementById('sel-s1-type').value;
+  const modelPath = document.getElementById('sel-s1-file').value;
+  const msg       = document.getElementById('s1-switch-msg');
+  const btn       = document.getElementById('btn-s1-switch');
+
+  if (modelType && !modelPath) {
+    msg.style.color = 'var(--warn)';
+    msg.textContent = 'Selecione o arquivo .cvimodel';
+    return;
+  }
+
+  btn.disabled    = true;
+  btn.textContent = 'Aguarde...';
+  msg.style.color = 'var(--dim)';
+  msg.textContent = modelType ? 'Carregando...' : 'Desativando...';
+
+  try {
+    const r = await fetch('/api/switch_stage1', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model_type: modelType, model_path: modelPath}),
+    });
+    const d = await r.json();
+    msg.style.color = d.ok ? 'var(--accent2)' : 'var(--warn)';
+    msg.textContent = d.message;
+  } catch(e) {
+    msg.style.color = 'var(--warn)';
+    msg.textContent = 'Erro de comunicação';
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = 'APLICAR';
+  }
+}
+
+loadS1Selector();
 </script>
 </body>
 </html>
@@ -1180,6 +1352,7 @@ class Handler(BaseHTTPRequestHandler):
                 "rtsp_url":     Handler.rtsp_url,
                 "stream_mode":  "flv" if _ffmpeg_available else "mjpeg",
                 "switch_status": _switch_status,
+                "stage1_model_type": _stage1_model_type,
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1211,13 +1384,17 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path == "/api/switch":
+        if self.path in ("/api/switch", "/api/switch_stage1"):
             length = int(self.headers.get("Content-Length", 0))
             body   = self.rfile.read(length)
             try:
-                req  = json.loads(body)
-                ok, msg = _do_switch_model(req.get("model_type", ""),
-                                           req.get("model_path", ""))
+                req = json.loads(body)
+                if self.path == "/api/switch":
+                    ok, msg = _do_switch_model(req.get("model_type", ""),
+                                               req.get("model_path", ""))
+                else:
+                    ok, msg = _do_switch_stage1(req.get("model_type", ""),
+                                                req.get("model_path", ""))
             except Exception as e:
                 ok, msg = False, str(e)
             payload = json.dumps({"ok": ok, "message": msg}).encode()
@@ -1366,6 +1543,13 @@ def parse_args():
                    help="Inverter verticalmente (flip cima↔baixo).")
     p.add_argument("--labels",    default="", dest="labels",
                    help="Nomes das classes: arquivo .txt ou 'cls0,cls1,...'")
+    p.add_argument("--stage1-model", default="", dest="stage1_model",
+                   help="Modelo do estágio 1 (ex: SCRFD) para pipeline dois estágios. "
+                        "Necessário para KEYPOINT_FACE_V2; pode ser configurado na "
+                        "interface web em 'Detector Facial (Stage-1)'.")
+    p.add_argument("--stage1-model-type", default="SCRFD_DET_FACE",
+                   dest="stage1_model_type",
+                   help="ModelType do estágio 1 (padrão: SCRFD_DET_FACE).")
     return p.parse_args()
 
 
@@ -1415,6 +1599,13 @@ def main():
         print("        Iniciando sem modelo — selecione na interface web.")
     else:
         print("Nenhum modelo inicial — selecione na interface web.")
+
+    # Stage-1 detector inicial (opcional — pipeline dois estágios)
+    if args.stage1_model:
+        ok, msg = _do_switch_stage1(args.stage1_model_type, args.stage1_model)
+        if not ok:
+            print(f"[ERRO] {msg}")
+            sys.exit(1)
 
     # RTSP server
     print(f"\nIniciando servidor RTSP {args.width}x{args.height} "
@@ -1466,6 +1657,11 @@ def main():
     _status = "Stopped"
     web_server.shutdown()
     with _detector_lock:
+        if _stage1_detector is not None:
+            try:
+                _stage1_detector.close()
+            except Exception:
+                pass
         if _detector is not None:
             try:
                 _detector.close()

@@ -16,6 +16,13 @@ Uso:
         [--session live] \\
         [--frames 0]
 
+Pipeline dois estágios (ex: SCRFD → KEYPOINT_FACE_V2):
+    python3 sample_rtsp_server.py \\
+        --model /root/cv181x/keypoint_face_v2_64_64_INT8_cv181x.cvimodel \\
+        --model-type KEYPOINT_FACE_V2 \\
+        --stage1-model /root/cv181x/scrfd_det_face_432_768_INT8_cv181x.cvimodel \\
+        --stage1-model-type SCRFD_DET_FACE
+
 Conectar ao stream:
     vlc rtsp://<ip-do-dispositivo>:554/<session>
     ffplay rtsp://<ip-do-dispositivo>:554/<session>
@@ -194,6 +201,13 @@ def parse_args():
                    help="Nomes das classes para modelos genéricos (YOLOV26, YOLOV8…). "
                         "Aceita caminho para arquivo .txt (uma classe por linha) "
                         "ou lista separada por vírgula: 'gato,cachorro,pássaro'.")
+    p.add_argument("--stage1-model", default="", dest="stage1_model",
+                   help="Modelo do estágio 1 (ex: SCRFD) para pipeline dois estágios. "
+                        "Necessário para modelos como KEYPOINT_FACE_V2 que requerem "
+                        "detecções faciais como entrada.")
+    p.add_argument("--stage1-model-type", default="SCRFD_DET_FACE",
+                   dest="stage1_model_type",
+                   help="ModelType do estágio 1 (padrão: SCRFD_DET_FACE).")
     return p.parse_args()
 
 
@@ -238,7 +252,14 @@ _VB_BUFFER_NUM = 5
 _vb_sem        = threading.Semaphore(_VB_BUFFER_NUM - 2)
 
 
-def _inference_worker(detector, cam, threshold):
+def _inference_worker(detector, cam, threshold, stage1_detector=None):
+    """Thread de inferência/release.
+
+    Se stage1_detector for fornecido, executa pipeline dois estágios:
+      1. stage1_detector.inference(frame)  → detecções (ex: faces do SCRFD)
+      2. detector.inference_with_detections(frame, faces) → landmarks por face
+    Caso contrário executa inferência simples: detector.inference(frame).
+    """
     global _running, _infer_fps, _infer_ms, _last_detect_frame
     t0    = time.time()
     count = 0
@@ -254,8 +275,12 @@ def _inference_worker(detector, cam, threshold):
 
         frame, do_infer = item
         if do_infer:
-            ti   = time.time()
-            dets = detector.inference(frame)
+            ti = time.time()
+            if stage1_detector is not None:
+                faces = stage1_detector.inference(frame)
+                dets  = detector.inference_with_detections(frame, faces) if faces else []
+            else:
+                dets = detector.inference(frame)
             _infer_ms = (time.time() - ti) * 1000
 
             with _det_lock:
@@ -299,6 +324,26 @@ def main():
     detector.set_threshold(args.threshold)
     print(f"Limiar de confiança: {detector.get_threshold():.2f}")
 
+    # --- Modelo stage 1 (opcional — para pipelines dois estágios) ---
+    # Dois estágios só fazem sentido para modelos de landmarks/keypoints.
+    # Para outros tipos (CLS_ATTRIBUTE, detectors, etc.) stage1 é ignorado.
+    stage1_detector = None
+    mt_upper = args.model_type.upper()
+    _needs_two_stage = "KEYPOINT" in mt_upper or "LANDMARK" in mt_upper
+    if args.stage1_model:
+        if not _needs_two_stage:
+            print(f"[AVISO] --stage1-model ignorado: {args.model_type} não é um "
+                  f"modelo de landmarks/keypoints que precise de dois estágios.")
+        else:
+            stage1_type = getattr(nn.ModelType, args.stage1_model_type, None)
+            if stage1_type is None:
+                print(f"[ERRO] Stage-1 ModelType desconhecido: {args.stage1_model_type}")
+                sys.exit(1)
+            print(f"Carregando stage-1 : {args.stage1_model}")
+            print(f"Stage-1 ModelType  : {args.stage1_model_type}")
+            stage1_detector = nn.get_model(stage1_type, args.stage1_model)
+            stage1_detector.set_threshold(args.threshold)
+
     # --- Servidor RTSP ---
     print(f"\nIniciando servidor RTSP {args.width}x{args.height} "
           f"codec={args.codec} bitrate={args.bitrate}kbps gop={args.gop} sessão={args.session} ...")
@@ -324,6 +369,7 @@ def main():
     infer_thread = threading.Thread(
         target=_inference_worker,
         args=(detector, cam, args.threshold),
+        kwargs={"stage1_detector": stage1_detector},
         daemon=True,
     )
     infer_thread.start()
@@ -424,6 +470,11 @@ def main():
         # interno do ViDecoder, então não é preciso chamar cam.release() aqui.
         with _release_lock:
             _release_queue.clear()
+        if stage1_detector is not None:
+            try:
+                stage1_detector.close()
+            except Exception:
+                pass
         detector.close()
         cam.close()
         del rtsp

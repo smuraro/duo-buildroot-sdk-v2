@@ -38,6 +38,112 @@ py::list PyModel::inference(const PyImage& image, const py::dict& parameters) {
   return outputParse(out_datas);
 }
 
+py::list PyModel::inferenceWithDetections(const PyImage& pyimg,
+                                          const py::list& det_list) {
+  if (det_list.empty()) return py::list();
+
+  // Build ModelBoxInfo from Python face-detection dicts (x1,y1,x2,y2,score).
+  // Add a 20% margin around each face box: landmark models are typically
+  // trained with some context around the face (not just the tight detection
+  // box), so including extra context stabilises the landmark predictions.
+  const float kPadRatio = 0.2f;
+  auto model_box_info = std::make_shared<ModelBoxInfo>();
+  for (auto item : det_list) {
+    py::dict d = item.cast<py::dict>();
+    float ox1 = d["x1"].cast<float>();
+    float oy1 = d["y1"].cast<float>();
+    float ox2 = d["x2"].cast<float>();
+    float oy2 = d["y2"].cast<float>();
+    float cw  = ox2 - ox1;
+    float ch  = oy2 - oy1;
+    ObjectBoxInfo box;
+    box.x1    = std::max(0.0f, ox1 - cw * kPadRatio);
+    box.y1    = std::max(0.0f, oy1 - ch * kPadRatio);
+    box.x2    = ox2 + cw * kPadRatio;  // VPSS clamps at image boundary
+    box.y2    = oy2 + ch * kPadRatio;
+    box.score = d.contains("score") ? d["score"].cast<float>() : 1.0f;
+    box.class_id = d.contains("class_id") ? d["class_id"].cast<int>() : 0;
+    model_box_info->bboxes.push_back(box);
+  }
+
+  auto image = pyimg.getImage();
+  std::vector<std::shared_ptr<ModelOutputInfo>> out_datas;
+  {
+    py::gil_scoped_release release;
+    model_->inference(image, model_box_info, out_datas, {});
+  }
+
+  // outputParse scales landmark coordinates by the full-frame dimensions
+  // (images[0]->getWidth()/Height()), but the model actually ran on a face
+  // crop.  Remap back to full-frame pixel coordinates:
+  //   stored  = output_point_x * frame_w
+  //   correct = output_point_x * crop_w + crop_x1
+  //           = (stored / frame_w) * crop_w + crop_x1
+  int n = std::min((int)out_datas.size(), (int)det_list.size());
+  py::list result;
+  for (int i = 0; i < n; ++i) {
+    auto lm = std::dynamic_pointer_cast<ModelLandmarksInfo>(out_datas[i]);
+    if (!lm) continue;
+
+    // The model ran on the PADDED crop stored in model_box_info->bboxes[i].
+    // outputParse() scales landmark coordinates by the full-frame dimensions
+    // instead of the crop dimensions, so we must remap:
+    //   stored  = output_point_x * frame_w
+    //   correct = output_point_x * crop_w + crop_x1
+    //           = (stored / frame_w) * crop_w + crop_x1
+    // Use the padded bbox for the crop geometry — it must match exactly what
+    // was passed to model_->inference().
+    const auto& padded = model_box_info->bboxes[i];
+    float pcw = padded.x2 - padded.x1;
+    float pch = padded.y2 - padded.y1;
+    float fw  = (float)lm->image_width;
+    float fh  = (float)lm->image_height;
+
+    if (fw > 0.f && fh > 0.f && pcw > 0.f && pch > 0.f) {
+      for (auto& x : lm->landmarks_x) x = (x / fw) * pcw + padded.x1;
+      for (auto& y : lm->landmarks_y) y = (y / fh) * pch + padded.y1;
+    }
+
+    // Return the ORIGINAL (non-padded) bbox for clean visualisation so the
+    // drawn box matches the face detector output, not the padded crop.
+    py::dict box_d = det_list[i].cast<py::dict>();
+    float x1 = box_d["x1"].cast<float>();
+    float y1 = box_d["y1"].cast<float>();
+    float x2 = box_d["x2"].cast<float>();
+    float y2 = box_d["y2"].cast<float>();
+
+    // Return dict in OBJECT_DETECTION_WITH_LANDMARKS format so _draw_inference
+    // draws both the face bbox (draw_detections) and the landmark dots
+    // (draw_keypoints) without any extra logic in the Python sample.
+    py::dict d;
+    d[py::str("x1")]         = x1;
+    d[py::str("y1")]         = y1;
+    d[py::str("x2")]         = x2;
+    d[py::str("y2")]         = y2;
+    d[py::str("score")]      = box_d.contains("score")
+                                   ? box_d["score"].cast<float>() : 1.0f;
+    d[py::str("class_id")]   = 0;
+    d[py::str("class_name")] = std::string("face");
+
+    py::list landmarks;
+    for (size_t j = 0; j < lm->landmarks_x.size(); ++j) {
+      py::list pt;
+      pt.append(lm->landmarks_x[j]);
+      pt.append(lm->landmarks_y[j]);
+      landmarks.append(pt);
+    }
+    d[py::str("landmarks")] = landmarks;
+
+    if (!lm->landmarks_score.empty()) {
+      py::list ls;
+      for (auto s : lm->landmarks_score) ls.append(s);
+      d[py::str("landmarks_score")] = ls;
+    }
+    result.append(d);
+  }
+  return result;
+}
+
 void PyModel::setThreshold(float threshold) {
   model_->setModelThreshold(threshold);
 }
