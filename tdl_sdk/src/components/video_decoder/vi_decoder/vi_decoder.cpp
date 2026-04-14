@@ -261,7 +261,8 @@ static int32_t vpss_vb_init_for_channel(int32_t vi_ch, int32_t w, int32_t h,
                                          PIXEL_FORMAT_E pix_fmt,
                                          int32_t pool_id,
                                          uint32_t max_w, uint32_t max_h,
-                                         int32_t *out_vpss_grp) {
+                                         int32_t *out_vpss_grp,
+                                         bool mirror, bool flip) {
   VPSS_GRP VpssGrp = -1;
   {
     VPSS_GRP_ATTR_S probe_attr = {};
@@ -298,8 +299,8 @@ static int32_t vpss_vb_init_for_channel(int32_t vi_ch, int32_t w, int32_t h,
   astVpssChnAttr.stFrameRate.s32SrcFrameRate = -1;
   astVpssChnAttr.stFrameRate.s32DstFrameRate = -1;
   astVpssChnAttr.u32Depth = 1;
-  astVpssChnAttr.bMirror = CVI_FALSE;
-  astVpssChnAttr.bFlip = CVI_FALSE;
+  astVpssChnAttr.bMirror = mirror ? CVI_TRUE : CVI_FALSE;
+  astVpssChnAttr.bFlip   = flip  ? CVI_TRUE : CVI_FALSE;
   astVpssChnAttr.stAspectRatio.enMode = ASPECT_RATIO_NONE;
   astVpssChnAttr.stNormalize.bEnable = CVI_FALSE;
   abChnEnable[0] = CVI_TRUE;
@@ -341,7 +342,7 @@ static int32_t vpss_vb_init_for_channel(int32_t vi_ch, int32_t w, int32_t h,
 }
 
 int32_t ViDecoder::initialize(int32_t w, int32_t h, ImageFormat image_fmt,
-                              int32_t vb_buffer_num) {
+                              int32_t vb_buffer_num, bool mirror, bool flip) {
   if (isInitialized) {
     LOGI("Camera have isInitialized\n");
     return 0;
@@ -576,7 +577,7 @@ int32_t ViDecoder::initialize(int32_t w, int32_t h, ImageFormat image_fmt,
     int32_t vpss_grp = -1;
     ret = vpss_vb_init_for_channel(i, w, h, pix_fmt, pool_id[i],
                                    stSize[i].u32Width, stSize[i].u32Height,
-                                   &vpss_grp);
+                                   &vpss_grp, mirror, flip);
     if (ret != CVI_SUCCESS) return ret;
     VpssGrp = vpss_grp;
     vpss_grps_.push_back(VpssGrp);

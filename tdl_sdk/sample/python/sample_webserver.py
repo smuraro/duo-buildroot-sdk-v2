@@ -48,9 +48,49 @@ COCO80_NAMES = [
     "hair drier","toothbrush",
 ]
 
+def _labels_from_factory(model_type_name: str) -> dict:
+    """Return {class_id: name} from model_factory.json via nn.get_model_types().
+
+    Returns empty dict if no types are defined for the model type.
+    """
+    try:
+        types = nn.get_model_types(model_type_name)
+        return {i: n for i, n in enumerate(types)} if types else {}
+    except Exception:
+        return {}
+
+
+def _load_labels(labels_arg: str) -> dict:
+    """Parse --labels into a dict {class_id: name}.
+
+    Accepts:
+      - path to a text file: one label per line, index = line number
+      - comma-separated string: "cat,dog,bird"
+    Returns empty dict if labels_arg is None/empty.
+    """
+    if not labels_arg:
+        return {}
+    if "," in labels_arg or not labels_arg.endswith(".txt"):
+        names = [n.strip() for n in labels_arg.split(",")]
+    else:
+        try:
+            with open(labels_arg) as f:
+                names = [l.rstrip("\n") for l in f if l.strip()]
+        except OSError as e:
+            print(f"[AVISO] Não foi possível abrir --labels '{labels_arg}': {e}")
+            return {}
+    return {i: n for i, n in enumerate(names)}
+
+
+# Labels customizados carregados em runtime (sobrepõem COCO80 e cls<N>)
+_custom_labels: dict = {}
+
+
 def _coco_name(class_id: int, class_name: str) -> str:
-    """Return proper class name: COCO80 lookup when class_name is generic."""
+    """Return proper class name: custom labels → COCO80 → original."""
     if class_name.startswith("cls") or class_name == "UNDEFINED":
+        if class_id in _custom_labels:
+            return _custom_labels[class_id]
         if 0 <= class_id < len(COCO80_NAMES):
             return COCO80_NAMES[class_id]
     return class_name
@@ -96,14 +136,58 @@ def _build_det_labels(detections):
     return labels
 
 
-def _enrich_class_names(detections):
-    """Return a copy of detections with resolved class_name (COCO80 lookup)."""
-    result = []
-    for d in detections:
-        d2 = dict(d)
-        d2["class_name"] = _coco_name(d.get("class_id", -1), d.get("class_name", "?"))
-        result.append(d2)
-    return result
+def _draw_inference(frame, dets, is_keypoint: bool, threshold: float):
+    """Dispatch inference result to the appropriate draw function."""
+    import numpy as np
+    if dets is None or isinstance(dets, np.ndarray) or not dets:
+        return
+    if isinstance(dets, (list, tuple)):
+        first = dets[0]
+        if isinstance(first, str):
+            image.draw_ocr(frame, dets)
+            return
+        if isinstance(first, dict):
+            if "output_width" in first:
+                image.draw_segmentation(frame, dets)
+                return
+            if "bboxes_seg" in first or "mask_width" in first:
+                image.draw_instance_segmentation(frame, dets,
+                                                 score_threshold=threshold)
+                return
+            if "landmarks" in first and "x1" not in first:
+                image.draw_keypoints(frame, dets, score_threshold=threshold)
+                return
+            if "x1" not in first and "landmarks" not in first and (
+                    "class_id" in first or any(
+                        k.endswith("_score") for k in first)):
+                if "class_id" in first and "class_name" not in first:
+                    dets = [{**d, "class_name": _coco_name(
+                                d.get("class_id", -1),
+                                f"cls{d.get('class_id', 0)}")}
+                            for d in dets if isinstance(d, dict)]
+                image.draw_classification(frame, dets)
+                return
+            # OBJECT_DETECTION / OBJECT_DETECTION_WITH_LANDMARKS
+            enriched = []
+            for d in dets:
+                d2 = dict(d)
+                d2["class_name"] = _coco_name(d.get("class_id", -1),
+                                               d.get("class_name", "?"))
+                enriched.append(d2)
+            if "landmarks" in first:
+                image.draw_detections(frame, enriched, score_threshold=threshold)
+                image.draw_keypoints(frame, enriched, score_threshold=threshold)
+            elif is_keypoint:
+                image.draw_keypoints(frame, enriched, score_threshold=threshold)
+            else:
+                image.draw_detections(frame, enriched, score_threshold=threshold)
+    elif isinstance(dets, dict):
+        if "output_width" in dets:
+            image.draw_segmentation(frame, dets)
+        elif "bboxes_seg" in dets:
+            image.draw_instance_segmentation(frame, dets, score_threshold=threshold)
+        elif "class_id" in dets or "is_male" in dets:
+            image.draw_classification(frame, dets)
 
 
 def inference_loop(args):
@@ -125,7 +209,8 @@ def inference_loop(args):
     # Open camera
     _set_state(status="Abrindo câmera...")
     print(f"\nAbrindo câmera {args.width}x{args.height} ...")
-    cam = image.Camera(args.width, args.height, image.ImageFormat.YUV420SP_VU)
+    cam = image.Camera(args.width, args.height, image.ImageFormat.YUV420SP_VU,
+                       mirror=args.mirror, flip=args.flip)
 
     _set_state(status="Running")
     print("Iniciando loop de inferência...\n")
@@ -154,15 +239,10 @@ def inference_loop(args):
             t1 = time.time()
             inf_ms = int((t1 - t0) * 1000)
 
-            # Draw (enrich class names for generic models like COCO80)
+            # Draw
             if detections:
-                named = _enrich_class_names(detections)
-                if is_keypoint_model:
-                    image.draw_keypoints(frame, named,
-                                         score_threshold=args.threshold)
-                else:
-                    image.draw_detections(frame, named,
-                                          score_threshold=args.threshold)
+                _draw_inference(frame, detections, is_keypoint_model,
+                                args.threshold)
             t2 = time.time()
             draw_ms = int((t2 - t1) * 1000)
 
@@ -205,6 +285,7 @@ def inference_loop(args):
         _set_state(status=f"Erro: {exc}")
         print(f"\n[ERRO] {exc}")
     finally:
+        detector.close()
         cam.close()
 
     elapsed = time.time() - t_start
@@ -703,21 +784,40 @@ def parse_args():
                    help="Altura da câmera em pixels (padrão: 720)")
     p.add_argument("--threshold",     type=float, default=0.5,
                    help="Limiar de confiança (padrão: 0.5)")
-    p.add_argument("--jpeg-quality",   type=int,   default=75,  dest="jpeg_quality",
-                   help="Qualidade JPEG do preview web 0-100 (padrão: 75)")
-    p.add_argument("--preview-scale", type=float, default=0.5, dest="preview_scale",
-                   help="Fator de escala do preview JPEG (padrão: 0.5 = metade da resolução, "
-                        "4x menos pixels, encode ~4x mais rápido)")
+    p.add_argument("--jpeg-quality",   type=int,   default=40,  dest="jpeg_quality",
+                   help="Qualidade JPEG do preview web 0-100 (padrão: 40). "
+                        "Com scale=1.0 a codificação é feita em hardware; "
+                        "qualidade 40 resulta em tamanho similar ao scale=0.5/quality=75.")
+    p.add_argument("--preview-scale", type=float, default=1.0, dest="preview_scale",
+                   help="Fator de escala do preview JPEG (padrão: 1.0 = resolução completa "
+                        "com codificação hardware). Use < 1.0 para forçar caminho software "
+                        "com resolução reduzida (ex: 0.5 = metade).")
     p.add_argument("--web-fps",        type=int,   default=5,   dest="web_fps",
                    help="Máximo de frames JPEG encodados por segundo para o web preview "
                         "(padrão: 5). Inferência roda mais rápido entre os encodes.")
     p.add_argument("--web-port",       type=int,   default=9000, dest="web_port",
                    help="Porta do servidor web (padrão: 9000)")
+    p.add_argument("--mirror", action="store_true", default=False,
+                   help="Espelhar horizontalmente a imagem da câmera (flip esquerda↔direita).")
+    p.add_argument("--flip",  action="store_true", default=False,
+                   help="Inverter verticalmente a imagem da câmera (flip cima↔baixo).")
+    p.add_argument("--labels", default="", dest="labels",
+                   help="Nomes das classes para modelos genéricos (YOLOV26, YOLOV8…). "
+                        "Aceita caminho para arquivo .txt (uma classe por linha) "
+                        "ou lista separada por vírgula: 'gato,cachorro,pássaro'.")
     return p.parse_args()
 
 
 def main():
+    global _custom_labels
     args = parse_args()
+    if args.labels:
+        _custom_labels = _load_labels(args.labels)
+        print(f"Labels carregados  : {len(_custom_labels)} classes (--labels)")
+    else:
+        _custom_labels = _labels_from_factory(args.model_type)
+        if _custom_labels:
+            print(f"Labels carregados  : {len(_custom_labels)} classes (model_factory.json)")
     model_name = os.path.basename(args.model)
 
     # Start web server in a background daemon thread

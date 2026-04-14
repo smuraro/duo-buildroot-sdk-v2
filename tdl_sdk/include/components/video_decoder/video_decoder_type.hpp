@@ -14,7 +14,8 @@ class VideoDecoder {
                        const std::map<std::string, int> &config = {}) = 0;
   virtual int32_t initialize(int32_t w = 1920, int32_t h = 1080,
                              ImageFormat image_fmt = ImageFormat::YUV420SP_VU,
-                             int32_t vb_buffer_num = 3) {
+                             int32_t vb_buffer_num = 3,
+                             bool mirror = false, bool flip = false) {
     return 0;
   };
   virtual int32_t read(std::shared_ptr<BaseImage> &image, int vi_chn = 0) = 0;

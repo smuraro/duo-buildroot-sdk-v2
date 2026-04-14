@@ -214,6 +214,33 @@ std::shared_ptr<BaseTensor> CviNet::getOutputTensor(const std::string& name) {
   return output_tensor_hash_[name];
 }
 
-int32_t CviNet::updateInputTensors() { return 0; }
+int32_t CviNet::updateInputTensors() {
+  // Restore each input tensor's physical address to its own ION buffer.
+  // This resets any redirect made by setInputTensorPhysicalAddr so the next
+  // frame starts with a clean state.
+  for (const auto& name : input_tensor_names_) {
+    CVI_TENSOR* t = CVI_NN_GetTensorByName(name.c_str(),
+                                           (CVI_TENSOR*)input_tensors_,
+                                           (int)input_tensor_names_.size());
+    if (t == nullptr) continue;
+    uint64_t original_paddr = input_output_tensor_infos_[name].phy_addr;
+    if (t->paddr != original_paddr) {
+      CVI_NN_SetTensorPhysicalAddr(t, original_paddr);
+    }
+  }
+  return 0;
+}
 
 int32_t CviNet::updateOutputTensors() { return 0; }
+
+int32_t CviNet::setInputTensorPhysicalAddr(const std::string& name,
+                                           uint64_t paddr) {
+  CVI_TENSOR* t = CVI_NN_GetTensorByName(name.c_str(),
+                                         (CVI_TENSOR*)input_tensors_,
+                                         (int)input_tensor_names_.size());
+  if (t == nullptr) {
+    LOGE("setInputTensorPhysicalAddr: tensor '%s' not found\n", name.c_str());
+    return -1;
+  }
+  return CVI_NN_SetTensorPhysicalAddr(t, paddr);
+}

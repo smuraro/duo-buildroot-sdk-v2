@@ -4,7 +4,9 @@
 #include <cassert>
 #include <iostream>
 
+#include "net/cvi_net.hpp"
 #include "preprocess/base_preprocessor.hpp"
+#include "preprocess/vpss_preprocessor.hpp"
 #include "utils/common_utils.hpp"
 #include "utils/tdl_log.hpp"
 void print_netparam(const NetParam& net_param) {
@@ -271,10 +273,27 @@ int32_t BaseModel::inference(
           assert(false);
         }
       } else {
+        // Zero-copy: when postPreprocess is a no-op and the preprocessor is
+        // a VpssPreprocessor, hint it to skip the CPU memcpy in the
+        // stride-mismatch case. The TPU will read directly from the VPSS
+        // output buffer via CVI_NN_SetTensorPhysicalAddr.
+        VpssPreprocessor* vpss =
+            dynamic_cast<VpssPreprocessor*>(preprocessor_.get());
+        CviNet* cvi = dynamic_cast<CviNet*>(net_.get());
+        bool zero_copy = (vpss != nullptr && cvi != nullptr &&
+                          !needsPostPreprocess() && fit_batch_size == 1);
+        if (zero_copy) vpss->setZeroCopyHint(true);
+
         preprocessor_->preprocessToTensor(
             images[process_idx + i], preprocess_params, i,
             net_->getInputTensor(input_layer_name));
         postPreprocess(net_->getInputTensor(input_layer_name), i);
+
+        if (zero_copy && vpss->getLastOutputPaddr() != 0) {
+          cvi->setInputTensorPhysicalAddr(input_layer_name,
+                                         vpss->getLastOutputPaddr());
+        }
+
         std::vector<float> rescale_params = preprocessor_->getRescaleConfig(
             preprocess_params, images[process_idx + i]->getWidth(),
             images[process_idx + i]->getHeight());
@@ -282,7 +301,7 @@ int32_t BaseModel::inference(
       }
     }
     model_timer_.TicToc("preprocess");
-    net_->updateInputTensors();
+    net_->updateInputTensors();  // resets any physical addr redirect
     net_->forward();
     model_timer_.TicToc("tpu");
     net_->updateOutputTensors();

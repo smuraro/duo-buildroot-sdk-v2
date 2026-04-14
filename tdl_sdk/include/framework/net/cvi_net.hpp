@@ -19,6 +19,11 @@ class CviNet : public BaseNet {
   int32_t updateInputTensors() override;
   int32_t updateOutputTensors() override;
 
+  // Zero-copy: redirect an input tensor's physical address to a pre-populated
+  // ION buffer (e.g. VPSS output) so CVI_NN_Forward reads from it directly.
+  // updateInputTensors() resets the address to the tensor's own ION buffer.
+  int32_t setInputTensorPhysicalAddr(const std::string& name, uint64_t paddr);
+
  private:
   void setupTensorInfo(CVI_TENSOR* cvi_tensor, int32_t num_tensors,
                        std::map<std::string, TensorInfo>& tensor_info);

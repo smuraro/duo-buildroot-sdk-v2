@@ -13,6 +13,8 @@ class YoloXDetection final : public BaseModel {
       std::vector<std::shared_ptr<ModelOutputInfo>> &out_datas) override;
 
   int32_t onModelOpened() override;
+  void postPreprocess(std::shared_ptr<BaseTensor> tensor, int batch_idx) override;
+  bool needsPostPreprocess() const override { return needs_packed_to_planar_; }
 
  private:
   void decodeBboxFeatureMap(int batch_idx, int stride, int basic_pos, int grid0,
@@ -24,4 +26,6 @@ class YoloXDetection final : public BaseModel {
   std::map<int, std::string> box_out_names_;
   int num_cls = 0;
   float nms_threshold_ = 0.5;
+  bool needs_packed_to_planar_ = false;
+  float model_qscale_ = 1.0f;
 };

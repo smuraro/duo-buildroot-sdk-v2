@@ -197,22 +197,28 @@ int32_t BaseTensor::copyFromImage(std::shared_ptr<BaseImage> image,
     return 0;
   }
 
-  // NCHW planar format: original logic unchanged.
+  // NCHW planar format.
   uint32_t plane_size = w * h * element_bytes_;
-  LOGI(
-      "copyFromImage NCHW, batch_idx:%d,img_stride:[%d,%d,%d], "
-      "batch_bytes:%d,plane_size:%d,w:%d,h:%d,plane_num:%d,src_ptrs:%p,dst_ptr:"
-      "%p",
-      batch_idx, image->getStrides()[0], image->getStrides()[1],
-      image->getStrides()[2], batch_bytes, plane_size, w, h,
-      image->getPlaneNum(), src_ptrs[0], dst_tensor_ptr);
-  LOGI(
-      "tensor "
-      "bytes:%d,memory_block_bytes:%d,memory_start:%p,memory_end:%p,element_"
-      "bytes:%d",
-      getCapacity(), memory_block_->size, memory_block_->virtualAddress,
-      (uint8_t*)(memory_block_->virtualAddress) + memory_block_->size,
-      element_bytes_);
+
+  // Special case: packed single-plane source (e.g. RGB_888) into a 3-channel
+  // NCHW tensor. The packed image has all H*W*3 bytes in one plane; copy them
+  // all into the start of the tensor buffer so postPreprocess can deinterleave.
+  if (image->getPlaneNum() == 1 && channels == 3) {
+    uint8_t* src_ptr    = src_ptrs[0];
+    uint32_t img_stride = image->getStrides()[0];
+    uint32_t row_bytes  = w * channels * element_bytes_;
+    if (img_stride == row_bytes) {
+      memcpy(dst_tensor_ptr, src_ptr, h * row_bytes);
+    } else {
+      for (uint32_t j = 0; j < h; j++) {
+        memcpy(dst_tensor_ptr + j * row_bytes,
+               src_ptr + j * img_stride,
+               row_bytes);
+      }
+    }
+    return 0;
+  }
+
   for (uint32_t i = 0; i < image->getPlaneNum(); i++) {
     uint8_t* src_ptr      = src_ptrs[i];
     uint8_t* dst_ptr      = dst_tensor_ptr + i * plane_size;
@@ -220,8 +226,6 @@ int32_t BaseTensor::copyFromImage(std::shared_ptr<BaseImage> image,
     if (img_stride_i == w * element_bytes_) {
       memcpy(dst_ptr, src_ptr, plane_size);
     } else {
-      LOGI("plane:%d,src_ptr:%p,dst_ptr:%p,img_stride_i:%d", i, src_ptr,
-           dst_ptr, img_stride_i);
       for (uint32_t j = 0; j < h; j++) {
         uint8_t* src_row_ptr = src_ptr + j * img_stride_i;
         uint8_t* dst_row_ptr = dst_ptr + j * w * element_bytes_;

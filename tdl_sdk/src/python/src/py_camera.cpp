@@ -6,7 +6,7 @@
 namespace pytdl {
 
 PyCamera::PyCamera(int32_t width, int32_t height, ImageFormat format,
-                   int32_t vb_buffer_num) {
+                   int32_t vb_buffer_num, bool mirror, bool flip) {
   decoder_ = VideoDecoderFactory::createVideoDecoder(VideoDecoderType::VI);
   if (!decoder_) {
     throw std::runtime_error("Failed to create VI video decoder");
@@ -18,7 +18,7 @@ PyCamera::PyCamera(int32_t width, int32_t height, ImageFormat format,
                              std::to_string(ret));
   }
 
-  ret = decoder_->initialize(width, height, format, vb_buffer_num);
+  ret = decoder_->initialize(width, height, format, vb_buffer_num, mirror, flip);
   if (ret != 0) {
     throw std::runtime_error("VideoDecoder initialize failed, ret: " +
                              std::to_string(ret));

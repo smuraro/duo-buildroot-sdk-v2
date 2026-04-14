@@ -82,7 +82,7 @@ int32_t YoloXDetection::outputParse(
     std::vector<std::shared_ptr<ModelOutputInfo>> &out_datas) {
   std::string input_tensor_name = net_->getInputNames()[0];
   TensorInfo input_tensor = net_->getTensorInfo(input_tensor_name);
-  uint32_t input_width = input_tensor.shape[3];
+  uint32_t input_width  = input_tensor.shape[3];
   uint32_t input_height = input_tensor.shape[2];
   float input_width_f = float(input_width);
   float input_height_f = float(input_height);
@@ -167,7 +167,6 @@ int32_t YoloXDetection::outputParse(
           box_objectness = yolox_sigmoid(box_objectness);
           class_score = yolox_sigmoid(class_score);
           float box_prob = box_objectness * class_score;
-          // std::cout<< box_prob<<std::endl;
           if (box_prob < model_threshold_) {
             basic_pos_class += num_cls;
             basic_pos_box += 4;
@@ -194,7 +193,10 @@ int32_t YoloXDetection::outputParse(
         }
       }
     }
-    DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
+    if (use_soft_nms_)
+      DetectionHelper::softNmsObjects(lb_boxes, model_threshold_, soft_nms_sigma_);
+    else
+      DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
     std::vector<float> scale_params =
         batch_rescale_params_[input_tensor_name][b];
     LOGI("scale_params:%f,%f,%f,%f", scale_params[0], scale_params[1],
@@ -222,42 +224,77 @@ int32_t YoloXDetection::outputParse(
 }
 
 YoloXDetection::YoloXDetection() {
+  // VPSS formula: INT8 = round(pixel * (1/std) * qscale)
+  // input qscale=127, pixels [0,255], INT8 range [-128,127].
+  // To map pixel 255 → INT8 127: (1/std)*127 = 127/255 → std = 255.0
+  // This gives: pixel 128 → INT8 64, pixel 255 → INT8 127.
   net_param_.model_config.mean = {0.0, 0.0, 0.0};
-  net_param_.model_config.std = {1.0, 1.0, 1.0};
+  net_param_.model_config.std = {255.0, 255.0, 255.0};
   net_param_.model_config.rgb_order = "rgb";
   keep_aspect_ratio_ = true;
 }
 
 int YoloXDetection::onModelOpened() {
   const auto &input_layer = net_->getInputNames()[0];
-  auto input_shape = net_->getTensorInfo(input_layer).shape;
+  TensorInfo input_info = net_->getTensorInfo(input_layer);
+  auto input_shape = input_info.shape;
   int input_h = input_shape[2];
   int input_w = input_shape[3];
+
+  // CV181X VPSS does not support PIXEL_FORMAT_RGB_888_PLANAR with INT8 output.
+  // Override preprocess_params_ to use RGB_PACKED UINT8 (which VPSS supports),
+  // then postPreprocess deinterleaves packed→planar and quantizes to INT8.
+  // YOLOX was compiled with --quant_input and scale=1/255, mean=0:
+  //   int8 = round(pixel * (1/255) / qscale) where qscale≈1/127
+  //   → int8 = round(pixel * 127 / 255) = round(pixel * 0.498)
+  //   pixel 0→0, pixel 128→63, pixel 255→127
+  if (input_info.data_type == TDLDataType::INT8) {
+    PreprocessParams& pp = preprocess_params_[input_layer];
+    pp.dst_image_format = ImageFormat::RGB_PACKED;
+    pp.dst_pixdata_type = TDLDataType::UINT8;  // VPSS writes UINT8 packed
+    pp.dst_width  = input_w;
+    pp.dst_height = input_h;
+    pp.keep_aspect_ratio = keep_aspect_ratio_;
+    pp.scale[0] = pp.scale[1] = pp.scale[2] = 1.0f;
+    pp.mean[0]  = pp.mean[1]  = pp.mean[2]  = 0.0f;
+    needs_packed_to_planar_ = true;
+    model_qscale_ = input_info.qscale;  // 127
+    LOGI("YoloX: RGB_PACKED UINT8 override, qscale=%.4f", input_info.qscale);
+  }
+
   strides.clear();
   const auto &output_layers = net_->getOutputNames();
   size_t num_output = output_layers.size();
+  LOGI("onModelOpened: input=%dx%d, num_outputs=%zu\n", input_w, input_h, num_output);
 
   for (size_t j = 0; j < num_output; j++) {
     auto oinfo = net_->getTensorInfo(output_layers[j]);
-    int feat_h = oinfo.shape[2];
-    int feat_w = oinfo.shape[3];
-    int channel = oinfo.shape[1];
+    LOGI("  output[%zu] %s shape=[%d,%d,%d,%d]\n", j, output_layers[j].c_str(),
+         oinfo.shape[0], oinfo.shape[1], oinfo.shape[2], oinfo.shape[3]);
+    // Model outputs use NHWC layout: [batch, H, W, C]
+    int feat_h  = oinfo.shape[1];
+    int feat_w  = oinfo.shape[2];
+    int channel = oinfo.shape[3];
     int stride_h = input_h / feat_h;
     int stride_w = input_w / feat_w;
 
-    if (j % 3 == 2) {
+    // Identify tensor type by channel count instead of positional index:
+    //   4 channels  → box regression output
+    //   1 channel   → objectness output
+    //   other       → class score output
+    if (channel == 4) {
+      box_out_names_[stride_h] = output_layers[j];
+      LOGI("box feature %s: (%d %d %d %d)\n", output_layers[j].c_str(),
+           oinfo.shape[0], oinfo.shape[1], oinfo.shape[2], oinfo.shape[3]);
+    } else if (channel == 1) {
+      object_out_names_[stride_h] = output_layers[j];
+      LOGI("object feature %s: (%d %d %d %d)\n", output_layers[j].c_str(),
+           oinfo.shape[0], oinfo.shape[1], oinfo.shape[2], oinfo.shape[3]);
+    } else {
       class_out_names_[stride_h] = output_layers[j];
       LOGI("class feature %s: (%d %d %d %d)\n", output_layers[j].c_str(),
            oinfo.shape[0], oinfo.shape[1], oinfo.shape[2], oinfo.shape[3]);
       strides.push_back(stride_h);
-    } else if (j % 3 == 0) {
-      box_out_names_[stride_h] = output_layers[j];
-      LOGI("box feature %s: (%d %d %d %d)\n", output_layers[j].c_str(),
-           oinfo.shape[0], oinfo.shape[1], oinfo.shape[2], oinfo.shape[3]);
-    } else {
-      object_out_names_[stride_h] = output_layers[j];
-      LOGI("object feature %s: (%d %d %d %d)\n", output_layers[j].c_str(),
-           oinfo.shape[0], oinfo.shape[1], oinfo.shape[2], oinfo.shape[3]);
     }
   }
   for (size_t i = 0; i < strides.size(); i++) {
@@ -269,6 +306,39 @@ int YoloXDetection::onModelOpened() {
   }
 
   return 0;
+}
+
+void YoloXDetection::postPreprocess(std::shared_ptr<BaseTensor> tensor,
+                                    int batch_idx) {
+  if (!needs_packed_to_planar_) return;
+
+  int H = tensor->getShape()[2];
+  int W = tensor->getShape()[3];
+  int plane = H * W;
+
+  uint8_t* buf = tensor->getBatchPtr<uint8_t>(batch_idx);
+
+  // Log first 16 bytes to see what copyFromImage actually wrote
+
+  std::vector<uint8_t> tmp(plane * 3);
+  std::memcpy(tmp.data(), buf, plane * 3);
+
+  // TPU-MLIR VPSS formula: int8 = round(pixel * (1/std) * qscale)
+  // YoloV8 uses std=254.97, qscale≈127 → scale = 127/255 ≈ 0.498 (works)
+  // YOLOX was compiled the same way → same scale applies.
+  // pixel=255 → int8=127, pixel=128 → int8=63, pixel=0 → int8=0
+  const float scale = model_qscale_ / 255.0f;
+  int8_t* dst = reinterpret_cast<int8_t*>(buf);
+  for (int c = 0; c < 3; c++) {
+    for (int i = 0; i < plane; i++) {
+      float v = tmp[i * 3 + c] * scale;
+      int iv = static_cast<int>(v + 0.5f);
+      if (iv > 127) iv = 127;
+      if (iv < -128) iv = -128;
+      dst[c * plane + i] = static_cast<int8_t>(iv);
+    }
+  }
+  tensor->flushCache();
 }
 
 YoloXDetection::~YoloXDetection() {}

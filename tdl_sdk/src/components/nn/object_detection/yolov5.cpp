@@ -268,7 +268,10 @@ int32_t YoloV5Detection::outputParse(
         anchor_pos += 2;
       }
     }
-    DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
+    if (use_soft_nms_)
+      DetectionHelper::softNmsObjects(lb_boxes, model_threshold_, soft_nms_sigma_);
+    else
+      DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
     std::vector<float> scale_params =
         batch_rescale_params_[input_tensor_name][b];
     LOGI("scale_params:%f,%f,%f,%f", scale_params[0], scale_params[1],

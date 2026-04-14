@@ -39,25 +39,8 @@ set( CMAKE_OBJCOPY      ${TC_PATH}${CROSS_COMPILE}objcopy
 	    CACHE FILEPATH "The toolchain objcopy command " FORCE )
 
 # Set the CMAKE C flags (which should also be used by the assembler!
-set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Os -std=gnu11" )
-set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=c906fdv" )
-set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64imafdcv0p7xthead" )
-set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mabi=lp64d" )
-set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffunction-sections" )
-set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fdata-sections" )
-set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-pointer-to-int-cast" )
-set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsigned-char -Wl,-gc-sections -lstdc++ -lm -lpthread" )
+set( CMAKE_C_FLAGS "-Os -std=gnu11 -mcpu=c906fdv -march=rv64imafdcv0p7xthead -mabi=lp64d -ffunction-sections -fdata-sections -Wno-pointer-to-int-cast -fsigned-char -Wl,-gc-sections -lstdc++ -lm -lpthread" CACHE STRING "" FORCE)
 
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Os" )
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=c906fdv" )
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64imafdcv0p7xthead" )
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mabi=lp64d" )
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsigned-char" )
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections" )
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fdata-sections" )
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC" )
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,-gc-sections -lm -lpthread" )
-set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-attributes" )
+set( CMAKE_CXX_FLAGS "-Os -mcpu=c906fdv -march=rv64imafdcv0p7xthead -mabi=lp64d -fsigned-char -ffunction-sections -fdata-sections -fPIC -Wl,-gc-sections -lm -lpthread -Wno-attributes" CACHE STRING "" FORCE)
 
-set( CMAKE_C_FLAGS "${CMAKE_C_FLAGS}" CACHE STRING "" )
-set( CMAKE_ASM_FLAGS "${CMAKE_C_FLAGS}" CACHE STRING "" )
+set( CMAKE_ASM_FLAGS "${CMAKE_C_FLAGS}" CACHE STRING "" FORCE)

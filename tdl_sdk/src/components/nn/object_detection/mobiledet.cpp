@@ -221,7 +221,10 @@ int32_t MobileDetV2Detection::outputParse(
 
     generate_dets_for_each_stride(lb_boxes);
 
-    DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
+    if (use_soft_nms_)
+      DetectionHelper::softNmsObjects(lb_boxes, model_threshold_, soft_nms_sigma_);
+    else
+      DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
 
     std::vector<float> scale_params =
         batch_rescale_params_[input_tensor_name][b];

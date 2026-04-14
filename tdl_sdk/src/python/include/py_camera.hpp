@@ -13,7 +13,8 @@ class PyCamera {
  public:
   PyCamera(int32_t width, int32_t height,
            ImageFormat format = ImageFormat::YUV420SP_VU,
-           int32_t vb_buffer_num = 3);
+           int32_t vb_buffer_num = 3,
+           bool mirror = false, bool flip = false);
   ~PyCamera();
 
   PyImage read(int32_t channel = 0);

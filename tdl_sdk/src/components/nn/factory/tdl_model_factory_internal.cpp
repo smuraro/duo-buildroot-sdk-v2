@@ -408,7 +408,8 @@ std::shared_ptr<BaseModel> TDLModelFactory::createObjectDetectionModel(
   // Attach COCO80 class names for models that use the full 80-class set.
   if (model_type == ModelType::YOLOV8_DET_COCO80 ||
       model_type == ModelType::YOLOV11N_DET_COCO80 ||
-      model_type == ModelType::YOLOV26_DET_COCO80) {
+      model_type == ModelType::YOLOV26_DET_COCO80 ||
+      model_type == ModelType::YOLOX_DET_COCO80) {
     static const char* kCoco80Names[80] = {
       "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
       "truck", "boat", "traffic light", "fire hydrant", "stop sign",

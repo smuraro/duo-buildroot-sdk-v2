@@ -279,7 +279,10 @@ int32_t YoloV26Detection::outputParse(
       }
     }
 
-    DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
+    if (use_soft_nms_)
+      DetectionHelper::softNmsObjects(lb_boxes, model_threshold_, soft_nms_sigma_);
+    else
+      DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
 
     const auto &scale_params = batch_rescale_params_[input_name][b];
     auto obj = std::make_shared<ModelBoxInfo>();

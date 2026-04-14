@@ -87,7 +87,6 @@ if (NOT IS_DIRECTORY  "${BUILD_DOWNLOAD_DIR}/kissfft-src")
   endif()
   
 else()
-  project(kissfft)
   add_subdirectory(${BUILD_DOWNLOAD_DIR}/kissfft-src
                    ${BUILD_DOWNLOAD_DIR}/kissfft-build)
   
@@ -125,7 +124,6 @@ if (NOT IS_DIRECTORY  "${BUILD_DOWNLOAD_DIR}/kaldi-native-fbank-src")
   FetchContent_MakeAvailable(kaldi-native-fbank)
   message("Content downloaded to ${kaldi-native-fbank_SOURCE_DIR}")
 else()
-  project(kaldi-native-fbank-src)
   add_subdirectory(${BUILD_DOWNLOAD_DIR}/kaldi-native-fbank-src/)
 
 endif()
@@ -159,7 +157,6 @@ if (NOT IS_DIRECTORY "${BUILD_DOWNLOAD_DIR}/googletest-src")
   FetchContent_MakeAvailable(googletest)
   message("Content downloaded to ${googletest_SOURCE_DIR}")
 else()
-  project(googletest)
   add_subdirectory(${BUILD_DOWNLOAD_DIR}/googletest-src/)
 endif()
 

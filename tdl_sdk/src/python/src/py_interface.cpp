@@ -4,7 +4,13 @@
 #include "py_matcher.hpp"
 #include "py_model.hpp"
 #include "py_rtsp.hpp"
+#ifdef HAVE_OPENCV_VIDEOIO
+#include "py_rtsp_client.hpp"
+#endif
+#include "py_rtsp_client_vdec.hpp"
 #include "utils/tokenizer_bpe.hpp"
+#include "nn/tdl_model_factory.hpp"
+#include "nn/tdl_model_defs.hpp"
 using namespace pytdl;
 using namespace pybind11::literals;
 
@@ -92,10 +98,15 @@ PYBIND11_MODULE(tdl, m) {
 
   // 摄像头捕获类
   py::class_<PyCamera>(image, "Camera")
-      .def(py::init<int32_t, int32_t, ImageFormat, int32_t>(),
+      .def(py::init<int32_t, int32_t, ImageFormat, int32_t, bool, bool>(),
            py::arg("width"), py::arg("height"),
            py::arg("format") = ImageFormat::YUV420SP_VU,
-           py::arg("vb_buffer_num") = 3)
+           py::arg("vb_buffer_num") = 3,
+           py::arg("mirror") = false,
+           py::arg("flip") = false,
+           "Open the camera.\n"
+           "mirror: horizontal flip (left ↔ right), done in VPSS hardware.\n"
+           "flip:  vertical flip   (top  ↔ bottom), done in VPSS hardware.")
       .def("read", &PyCamera::read, py::arg("channel") = 0,
            "Capture one frame from the camera and return it as an Image")
       .def("release", &PyCamera::release, py::arg("channel") = 0,
@@ -104,15 +115,82 @@ PYBIND11_MODULE(tdl, m) {
       .def("__enter__", &PyCamera::enter, py::return_value_policy::reference)
       .def("__exit__", &PyCamera::exit);
 
+#ifdef HAVE_OPENCV_VIDEOIO
+  // RTSP / video-file client (software decode via OpenCV/FFmpeg)
+  py::class_<PyRtspClient>(image, "RtspClient")
+      .def(py::init<const std::string&, int, int, int, const std::string&>(),
+           py::arg("url"),
+           py::arg("width") = 0, py::arg("height") = 0,
+           py::arg("timeout_ms") = 5000,
+           py::arg("transport") = "tcp",
+           "Open an RTSP stream or video file for decoding (software decode).\n"
+           "url:        RTSP/RTMP/HLS URL or local video file path.\n"
+           "width/height: resize frames to this resolution (0 = native).\n"
+           "timeout_ms: connection and read timeout in milliseconds.\n"
+           "transport:  'tcp' (default, reliable) or 'udp' (lower latency).")
+      .def("read", &PyRtspClient::read,
+           "Decode the next frame and return it as a VPSSImage.\n"
+           "Compatible with model.inference() and RTSPServer.send_frame().\n"
+           "Raises RuntimeError on end-of-stream or timeout.")
+      .def("release", &PyRtspClient::release,
+           "No-op. Provided for API compatibility with Camera.")
+      .def("close", &PyRtspClient::close, "Close the stream and free decoder resources.")
+      .def("is_opened", &PyRtspClient::isOpened, "Return True if the stream is open.")
+      .def("__enter__", &PyRtspClient::enter, py::return_value_policy::reference)
+      .def("__exit__", &PyRtspClient::exit);
+#endif  // HAVE_OPENCV_VIDEOIO
+
+  // Hardware-accelerated RTSP client (live555 + VDEC)
+  py::class_<PyRtspClientVdec>(image, "RtspClientVdec")
+      .def(py::init<const std::string&, int, int, int, const std::string&>(),
+           py::arg("url"),
+           py::arg("width") = 0, py::arg("height") = 0,
+           py::arg("timeout_ms") = 5000,
+           py::arg("transport") = "tcp",
+           "Open an RTSP stream using live555 (RTSP/RTP) + VDEC hardware decode.\n"
+           "H264 and H265 streams are decoded by the VDEC unit — zero CPU cost.\n"
+           "Decoded frames are YUV420 NV12 in VB memory, compatible with inference.\n"
+           "url:         RTSP stream URL (rtsp://...).\n"
+           "width/height: maximum decode resolution; 0 = use native stream resolution.\n"
+           "timeout_ms:  per-frame CVI_VDEC_GetFrame timeout in milliseconds.\n"
+           "transport:   'tcp' (default, more reliable) or 'udp' (lower latency).")
+      .def("read", &PyRtspClientVdec::read,
+           "Decode the next frame via VDEC hardware.\n"
+           "Returns a VPSSImage (YUV420 NV12) compatible with model.inference().\n"
+           "IMPORTANT: call release() before calling read() again.")
+      .def("release", &PyRtspClientVdec::release,
+           "Return the current frame buffer to the VDEC pool.\n"
+           "Must be called after each read() before the next read().")
+      .def("pin_for_inference", &PyRtspClientVdec::pinForInference,
+           "Move the current held frame to the inference slot so the inference\n"
+           "thread can safely read it while read() fetches the next frame.\n"
+           "Call AFTER send_frame() (no more writes to the frame).")
+      .def("release_inference", &PyRtspClientVdec::releaseInference,
+           "Release the inference slot back to the VDEC pool.\n"
+           "Call AFTER the inference thread has finished (future.result() returned).")
+      .def("close", &PyRtspClientVdec::close,
+           "Stop the stream and release all resources.")
+      .def("is_opened", &PyRtspClientVdec::isOpened,
+           "Return True if the stream is open and VDEC is running.")
+      .def("__enter__", &PyRtspClientVdec::enter,
+           py::return_value_policy::reference)
+      .def("__exit__", &PyRtspClientVdec::exit);
+
   // RTSP streaming server
   py::class_<PyRTSP>(image, "RTSPServer")
       .def(py::init<int32_t, int32_t, int32_t, const std::string&,
-                    const std::string&>(),
+                    const std::string&, int32_t, int32_t, int32_t>(),
            py::arg("width"), py::arg("height"), py::arg("chn") = 0,
            py::arg("codec") = "h264", py::arg("session_name") = "",
+           py::arg("bitrate") = 3072, py::arg("gop") = 15, py::arg("fps") = 25,
            "Create an RTSP server.  Access stream at rtsp://<ip>:554/<session_name>.\n"
            "codec: 'h264' (default) or 'h265'.\n"
-           "session_name: URL path (defaults to codec name).")
+           "session_name: URL path (defaults to codec name).\n"
+           "bitrate: encoding bitrate in kbps (default 3072). Higher = better quality during motion.\n"
+           "gop: keyframe interval in frames (default 15). Smaller = sharper during motion.\n"
+           "fps: source/destination frame rate (default 25). MUST match the actual frame rate\n"
+           "     your application sends frames. Wrong value causes poor quality (rate control\n"
+           "     mis-allocation) and regions that do not update visually.")
       .def("send_frame", &PyRTSP::sendFrame, py::arg("frame"),
            "Encode and send a hardware camera frame over RTSP.\n"
            "frame must be a VPSSImage obtained from Camera.read().")
@@ -147,6 +225,29 @@ PYBIND11_MODULE(tdl, m) {
             "Draw keypoints and skeleton lines on a hardware frame.\n"
             "Uses COCO-17 skeleton when 17 keypoints are detected.");
 
+  image.def("draw_classification", &drawClassification,
+            py::arg("frame"), py::arg("result"),
+            "Draw classification or attribute result (CLASSIFICATION, CLS_ATTRIBUTE).\n"
+            "Renders a label box in the top-left corner of the frame.");
+
+  image.def("draw_segmentation", &drawSegmentation,
+            py::arg("frame"), py::arg("result"),
+            py::arg("alpha") = 0.5f,
+            "Draw semantic segmentation overlay (SEGMENTATION).\n"
+            "alpha: blend factor 0.0-1.0 (default 0.5).");
+
+  image.def("draw_instance_segmentation", &drawInstanceSegmentation,
+            py::arg("frame"), py::arg("result"),
+            py::arg("score_threshold") = 0.0f,
+            py::arg("alpha") = 0.45f,
+            "Draw instance segmentation: bboxes + mask overlays\n"
+            "(OBJECT_DETECTION_WITH_SEGMENTATION).\n"
+            "alpha: mask blend factor (default 0.45).");
+
+  image.def("draw_ocr", &drawOcr,
+            py::arg("frame"), py::arg("result"),
+            "Draw OCR text result at the bottom of the frame (OCR_INFO).");
+
   image.def("frame_to_jpeg", &frameToJpeg,
             py::arg("frame"), py::arg("quality") = 80, py::arg("scale") = 1.0f,
             "Convert a hardware camera frame (VPSSImage) to JPEG bytes.\n"
@@ -166,6 +267,11 @@ PYBIND11_MODULE(tdl, m) {
   model_type_enum.export_values();
 
   py::class_<PyModel>(nn, "Model")
+      .def("close", &PyModel::close,
+           "Release the model and its VPSS preprocessor group immediately.\n"
+           "Call before script exit to avoid exhausting VPSS groups.")
+      .def("__enter__", [](PyModel& m) -> PyModel& { return m; })
+      .def("__exit__", [](PyModel& m, py::object, py::object, py::object) { m.close(); })
       .def("get_preprocess_parameters", &PyModel::getPreprocessParameters)
       .def("inference", py::overload_cast<const PyImage&>(&PyModel::inference),
            py::arg("image"))
@@ -181,6 +287,13 @@ PYBIND11_MODULE(tdl, m) {
            "Run inference with extra runtime parameters (e.g. score threshold)")
       .def("set_threshold", &PyModel::setThreshold, py::arg("threshold"))
       .def("get_threshold", &PyModel::getThreshold)
+      .def("set_soft_nms", &PyModel::setSoftNms,
+           py::arg("enable"), py::arg("sigma") = 0.5f,
+           "Enable Gaussian Soft NMS.  Decays overlapping box scores by "
+           "exp(-iou²/sigma) instead of hard-removing them.\n"
+           "sigma: decay rate (default 0.5, paper default). Smaller = "
+           "stronger suppression.")
+      .def("get_soft_nms", &PyModel::getSoftNms)
       .def("get_input_names", &PyModel::getInputNames)
       .def("get_output_names", &PyModel::getOutputNames);
 
@@ -189,6 +302,47 @@ PYBIND11_MODULE(tdl, m) {
          py::arg("device_id") = 0);
   nn.def("get_model_from_dir", get_model_with_dir, py::arg("model_type"),
          py::arg("model_dir") = "", py::arg("device_id") = 0);
+
+  nn.def("get_model_types",
+         [](const std::string& model_type_name) -> py::list {
+           ModelType mt = modelTypeFromString(model_type_name);
+           auto& factory = TDLModelFactory::getInstance();
+           factory.loadModelConfig();
+           ModelConfig cfg = factory.getModelConfig(mt);
+           py::list result;
+           for (const auto& t : cfg.types)
+             result.append(t);
+           return result;
+         },
+         py::arg("model_type"),
+         "Return the class name list for a model type as defined in "
+         "model_factory.json. Returns an empty list if no types are defined "
+         "(e.g. generic YOLOV26).");
+
+  nn.def("get_available_model_types",
+         []() -> py::list {
+           auto& factory = TDLModelFactory::getInstance();
+           factory.loadModelConfig();
+           py::list result;
+           for (const auto& name : factory.getModelList())
+             result.append(name);
+           return result;
+         },
+         "Return all model type names available in model_factory.json.");
+
+  nn.def("get_model_filename",
+         [](const std::string& model_type_name) -> std::string {
+           ModelType mt = modelTypeFromString(model_type_name);
+           auto& factory = TDLModelFactory::getInstance();
+           ModelConfig cfg = factory.getModelConfig(mt);
+           auto it = cfg.custom_config_str.find("file_name");
+           if (it != cfg.custom_config_str.end()) return it->second;
+           return "";
+         },
+         py::arg("model_type"),
+         "Return the base file_name for a model type as defined in model_factory.json "
+         "(e.g. 'scrfd_det_face_432_768_INT8'). Build the full path by appending "
+         "'_<platform>.cvimodel' and prepending the model directory.");
 
   // Tracker
   py::enum_<TDLObjectType>(nn, "ObjectType")

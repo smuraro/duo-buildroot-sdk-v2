@@ -401,7 +401,10 @@ int32_t YoloV8Detection::outputParse(
         lb_boxes[max_logit_c].push_back(bbox);
       }
     }
-    DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
+    if (use_soft_nms_)
+      DetectionHelper::softNmsObjects(lb_boxes, model_threshold_, soft_nms_sigma_);
+    else
+      DetectionHelper::nmsObjects(lb_boxes, nms_threshold_);
     std::vector<float> scale_params =
         batch_rescale_params_[input_tensor_name][b];
 

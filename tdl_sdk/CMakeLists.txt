@@ -189,8 +189,6 @@ foreach(flags CMAKE_CXX_FLAGS CMAKE_C_FLAGS)
     string(REPLACE "-O3" "-Os" ${flags} "${${flags}}")
 endforeach()
 
-include(${CMAKE_TOOLCHAIN_FILE})
-
 message("==================================================")
 message("Branch                 ${LATEST_BRANCH}")
 message("Latest tag             ${LATEST_TAG}")

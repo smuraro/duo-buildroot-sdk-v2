@@ -215,6 +215,64 @@ void DetectionHelper::nmsObjects(
     nmsObjects(object.second, iou_threshold);
   }
 }
+
+void DetectionHelper::softNmsObjects(std::vector<ObjectBoxInfo> &objects,
+                                     float score_threshold, float sigma) {
+  // Gaussian Soft NMS: for each selected box, decay overlapping candidates'
+  // scores by exp(-iou^2/sigma) instead of hard-removing them.
+  // Algorithm:
+  //   1. Find box with highest score → add to output, mark as processed.
+  //   2. For every remaining box, compute IoU with selected; decay score.
+  //   3. Re-sort remaining boxes by decayed score; repeat until none left.
+  //   4. Remove boxes whose score fell below score_threshold.
+  std::sort(objects.begin(), objects.end(),
+            [](const ObjectBoxInfo &a, const ObjectBoxInfo &b) {
+              return a.score > b.score;
+            });
+
+  int n = static_cast<int>(objects.size());
+  for (int i = 0; i < n; ++i) {
+    // Bring the highest-scoring remaining box to position i
+    int max_idx = i;
+    for (int j = i + 1; j < n; ++j) {
+      if (objects[j].score > objects[max_idx].score) max_idx = j;
+    }
+    if (max_idx != i) std::swap(objects[i], objects[max_idx]);
+
+    float x1 = objects[i].x1, y1 = objects[i].y1;
+    float x2 = objects[i].x2, y2 = objects[i].y2;
+    float area1 = (x2 - x1 + 1.0f) * (y2 - y1 + 1.0f);
+
+    for (int j = i + 1; j < n; ++j) {
+      float ix = std::max(x1, objects[j].x1);
+      float iy = std::max(y1, objects[j].y1);
+      float iw = std::min(x2, objects[j].x2) - ix + 1.0f;
+      float ih = std::min(y2, objects[j].y2) - iy + 1.0f;
+      if (iw <= 0.0f || ih <= 0.0f) continue;
+
+      float area2 = (objects[j].x2 - objects[j].x1 + 1.0f) *
+                    (objects[j].y2 - objects[j].y1 + 1.0f);
+      float iou = (iw * ih) / (area1 + area2 - iw * ih);
+      // Gaussian decay
+      objects[j].score *= std::exp(-(iou * iou) / sigma);
+    }
+  }
+
+  // Remove boxes whose score fell below threshold
+  objects.erase(std::remove_if(objects.begin(), objects.end(),
+                               [score_threshold](const ObjectBoxInfo &b) {
+                                 return b.score < score_threshold;
+                               }),
+                objects.end());
+}
+
+void DetectionHelper::softNmsObjects(
+    std::map<int, std::vector<ObjectBoxInfo>> &objects, float score_threshold,
+    float sigma) {
+  for (auto &object : objects) {
+    softNmsObjects(object.second, score_threshold, sigma);
+  }
+}
 void DetectionHelper::nmsObjects(
     std::vector<ObjectBoxSegmentationInfo> &objects, float iou_threshold,
     std::vector<std::pair<int, uint32_t>> &stride_index) {

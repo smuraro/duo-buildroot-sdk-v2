@@ -7,6 +7,16 @@
 #include <algorithm>
 #include <cstring>
 
+#if defined(__CV181X__) || defined(__CV180X__) || defined(__CV182X__) || \
+    defined(__CV183X__) || defined(__CV184X__) || defined(__CV186X__)
+#include "encoder/image_encoder/image_encoder.hpp"
+// JPEG uses VENC channel 1 (channel 0 is reserved for H264/H265 streaming).
+static ImageEncoder& hwJpegEncoder() {
+  static ImageEncoder enc(1);
+  return enc;
+}
+#endif
+
 namespace pytdl {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -215,7 +225,8 @@ static void yuvBlitText(uint8_t* yp, int ys, const char* text,
 // ─── PyRTSP ──────────────────────────────────────────────────────────────────
 
 PyRTSP::PyRTSP(int32_t width, int32_t height, int32_t chn,
-               const std::string& codec, const std::string& session_name) {
+               const std::string& codec, const std::string& session_name,
+               int32_t bitrate, int32_t gop, int32_t fps) {
   PAYLOAD_TYPE_E payload;
   if (codec == "h265" || codec == "H265")      payload = PT_H265;
   else if (codec == "h264" || codec == "H264") payload = PT_H264;
@@ -225,9 +236,10 @@ PyRTSP::PyRTSP(int32_t width, int32_t height, int32_t chn,
                       ? (codec == "h265" ? "h265" : "h264")
                       : session_name;
 
-  rtsp_ = std::make_unique<RTSP>(chn, payload, width, height, session_name_);
-  LOGI("[PyRTSP] started  chn=%d %dx%d codec=%s  url=rtsp://<ip>:554/%s\n",
-       chn, width, height, codec.c_str(), session_name_.c_str());
+  rtsp_ = std::make_unique<RTSP>(chn, payload, width, height, session_name_,
+                                 bitrate, gop, fps);
+  LOGI("[PyRTSP] started  chn=%d %dx%d codec=%s  bitrate=%dkbps gop=%d fps=%d  url=rtsp://<ip>:554/%s\n",
+       chn, width, height, codec.c_str(), bitrate, gop, fps, session_name_.c_str());
 }
 
 PyRTSP::~PyRTSP() { rtsp_.reset(); }
@@ -326,12 +338,12 @@ void drawDetections(PyImage& image, const py::list& detections,
   CVI_SYS_IonFlushCache(m.uv_pa, m.uv_va, m.uv_len);
 }
 
-// COCO-17 skeleton connectivity
+// COCO-17 skeleton connectivity (19 pairs, matches C++ sample_img_human_keypoint.cpp)
 static const int kCOCO17Skeleton[][2] = {
-    {0,1},{0,2},{1,3},{2,4},
-    {5,6},{5,7},{7,9},{6,8},{8,10},
-    {5,11},{6,12},{11,12},
-    {11,13},{13,15},{12,14},{14,16}
+    {15,13},{13,11},{16,14},{14,12},{11,12},
+    {5,11}, {6,12}, {5,6},  {5,7},  {6,8},
+    {7,9},  {8,10}, {1,2},  {0,1},  {0,2},
+    {1,3},  {2,4},  {3,5},  {4,6}
 };
 static const int kCOCO17SkeletonLen =
     (int)(sizeof(kCOCO17Skeleton) / sizeof(kCOCO17Skeleton[0]));
@@ -352,38 +364,451 @@ void drawKeypoints(PyImage& image, const py::list& detections_with_landmarks,
 
   for (auto item : detections_with_landmarks) {
     py::dict det = item.cast<py::dict>();
-    float score = det.contains("score") ? det["score"].cast<float>() : 1.0f;
+
+    std::vector<float> lx, ly, ls;
+
+    if (det.contains("landmarks_x") && det.contains("landmarks_y")) {
+      // Format A: separate flat lists  {"landmarks_x": [...], "landmarks_y": [...]}
+      lx = det["landmarks_x"].cast<std::vector<float>>();
+      ly = det["landmarks_y"].cast<std::vector<float>>();
+    } else if (det.contains("landmarks")) {
+      // Format B: list of [x,y] pairs  {"landmarks": [[x0,y0], [x1,y1], ...]}
+      for (auto pt_obj : det["landmarks"].cast<py::list>()) {
+        auto pt = pt_obj.cast<py::list>();
+        lx.push_back(pt[0].cast<float>());
+        ly.push_back(pt[1].cast<float>());
+      }
+    } else {
+      continue;
+    }
+
+    // landmarks_score: accept either a flat list or a single float
+    if (det.contains("landmarks_score")) {
+      py::object lso = det["landmarks_score"];
+      try {
+        ls = lso.cast<std::vector<float>>();
+      } catch (...) {
+        ls.assign(lx.size(), lso.cast<float>());
+      }
+    }
+
+    // Overall confidence: use "score" if present, otherwise landmarks_score[0].
+    // For OBJECT_LANDMARKS models (e.g. KEYPOINT_FACE_V2) there is no "score"
+    // key — landmarks_score[0] is the face presence confidence.
+    float score = 1.0f;
+    if (det.contains("score")) {
+      score = det["score"].cast<float>();
+    } else if (!ls.empty()) {
+      score = ls[0];
+    }
     if (score < score_threshold) continue;
-    if (!det.contains("landmarks_x") || !det.contains("landmarks_y")) continue;
 
-    auto lx = det["landmarks_x"].cast<std::vector<float>>();
-    auto ly = det["landmarks_y"].cast<std::vector<float>>();
-    std::vector<float> ls;
-    if (det.contains("landmarks_score"))
-      ls = det["landmarks_score"].cast<std::vector<float>>();
     int n = (int)std::min(lx.size(), ly.size());
+    if (n == 0) continue;
 
-    // Skeleton lines
+    // Auto-detect normalized coordinates [0.0, 1.0].
+    // Models like KEYPOINT_HAND output normalized values; pose/face use pixels.
+    // Heuristic: if every x AND y value is in [0, 1] the coords are normalized.
+    {
+      float mx = *std::max_element(lx.begin(), lx.end());
+      float my = *std::max_element(ly.begin(), ly.end());
+      if (mx <= 1.0f && my <= 1.0f) {
+        for (auto& v : lx) v *= fw;
+        for (auto& v : ly) v *= fh;
+      }
+    }
+
+    // Only use per-landmark scores when the scores vector matches the number
+    // of landmarks.  Some models (e.g. KEYPOINT_FACE_V2) return a smaller
+    // scores vector (face score + blurness) that must NOT be used as a
+    // per-landmark filter.
+    bool use_per_pt_score = ((int)ls.size() == n);
+
+    // Lane detection: exactly 2 points → draw a line segment, not dots.
+    static const YUVColor kLane = YUVColor::fromRGB(0, 220, 0); // green
+    if (n == 2) {
+      yuvDrawLine(m.y_va, m.uv_va, ys, us, nv21,
+                  (int)lx[0], (int)ly[0], (int)lx[1], (int)ly[1],
+                  kLane, fw, fh);
+      continue;
+    }
+
+    // Skeleton lines (COCO-17 pose, 19 connections)
     if (n == 17) {
       for (int k = 0; k < kCOCO17SkeletonLen; ++k) {
         int a = kCOCO17Skeleton[k][0], b = kCOCO17Skeleton[k][1];
         if (a >= n || b >= n) continue;
-        if (!(ls.empty() ? true : ls[a] >= 0.3f)) continue;
-        if (!(ls.empty() ? true : ls[b] >= 0.3f)) continue;
+        if (use_per_pt_score && ls[a] < 0.3f) continue;
+        if (use_per_pt_score && ls[b] < 0.3f) continue;
         yuvDrawLine(m.y_va, m.uv_va, ys, us, nv21,
                     (int)lx[a], (int)ly[a], (int)lx[b], (int)ly[b],
                     kBone, fw, fh);
       }
     }
 
-    // Joint dots
+    // Joint dots — radius scales with image height for visibility
+    int dot_r = std::max(3, fh / 180);
     for (int k = 0; k < n; ++k) {
-      if (!ls.empty() && ls[k] < 0.3f) continue;
+      if (use_per_pt_score && ls[k] < 0.3f) continue;
       yuvDrawCircle(m.y_va, m.uv_va, ys, us, nv21,
-                    (int)lx[k], (int)ly[k], 3, kJoint, fw, fh);
+                    (int)lx[k], (int)ly[k], dot_r, kJoint, fw, fh);
     }
   }
 
+  CVI_SYS_IonFlushCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonFlushCache(m.uv_pa, m.uv_va, m.uv_len);
+}
+
+// ─── Draw Classification ─────────────────────────────────────────────────────
+//
+// Draws a text label for CLASSIFICATION and CLS_ATTRIBUTE outputs.
+// result: a list or dict as returned by model.inference().
+// Renders a filled label box in the top-left corner of the frame.
+
+void drawClassification(PyImage& image, const py::object& result) {
+  VPSSImage* vpss = requireVPSS(image, "draw_classification");
+  int fh = (int)vpss->getHeight(), fw = (int)vpss->getWidth();
+  auto st = vpss->getStrides();
+  int ys = (int)st[0], us = (int)st[1];
+  bool nv21 = (vpss->getImageFormat() == ImageFormat::YUV420SP_VU);
+
+  py::dict det;
+  if (py::isinstance<py::list>(result)) {
+    py::list lst = result.cast<py::list>();
+    if (lst.empty()) return;
+    if (!py::isinstance<py::dict>(lst[0])) return;
+    det = lst[0].cast<py::dict>();
+  } else if (py::isinstance<py::dict>(result)) {
+    det = result.cast<py::dict>();
+  } else {
+    return;
+  }
+
+  // Build list of lines to display
+  std::vector<std::string> lines;
+  char buf[256];
+
+  // ── CLS_ATTRIBUTE: iterate dynamically over all *_score keys ──────────────
+  // Display order follows kAttrOrder; any unknown attr_* keys are appended.
+  static const std::vector<std::string> kAttrOrder = {
+      "gender", "age", "glasses", "mask", "hat", "emotion", "pose", "blurness"};
+
+  bool is_attr = false;
+  for (const auto& name : kAttrOrder) {
+    std::string score_key = name + "_score";
+    if (!det.contains(score_key.c_str())) continue;
+    is_attr = true;
+    float score = det[score_key.c_str()].cast<float>();
+
+    if (name == "gender") {
+      const char* v = (det.contains("is_male") && det["is_male"].cast<bool>())
+                      ? "Male" : "Female";
+      snprintf(buf, sizeof(buf), "Gender : %s  %.0f%%", v, score * 100.f);
+    } else if (name == "age") {
+      int age = det.contains("age") ? det["age"].cast<int>()
+                                    : static_cast<int>(score * 100.f);
+      snprintf(buf, sizeof(buf), "Age    : %d", age);
+    } else if (name == "glasses") {
+      const char* v = (det.contains("is_wearing_glasses") &&
+                       det["is_wearing_glasses"].cast<bool>()) ? "Yes" : "No";
+      snprintf(buf, sizeof(buf), "Glasses: %s  %.0f%%", v, score * 100.f);
+    } else if (name == "mask") {
+      const char* v = (det.contains("is_wearing_mask") &&
+                       det["is_wearing_mask"].cast<bool>()) ? "Yes" : "No";
+      snprintf(buf, sizeof(buf), "Mask   : %s  %.0f%%", v, score * 100.f);
+    } else if (name == "hat") {
+      const char* v = (det.contains("is_wearing_hat") &&
+                       det["is_wearing_hat"].cast<bool>()) ? "Yes" : "No";
+      snprintf(buf, sizeof(buf), "Hat    : %s  %.0f%%", v, score * 100.f);
+    } else {
+      // emotion / pose / blurness: show label + raw score
+      std::string label = name;
+      label[0] = static_cast<char>(toupper(static_cast<unsigned char>(label[0])));
+      snprintf(buf, sizeof(buf), "%-7s: %.2f", label.c_str(), score);
+    }
+    lines.emplace_back(buf);
+  }
+  // Any attr_<id>_score keys not in kAttrOrder (future enum values)
+  if (is_attr) {
+    for (auto item : det) {
+      std::string key = item.first.cast<std::string>();
+      if (key.size() > 11 &&
+          key.substr(0, 5) == "attr_" &&
+          key.substr(key.size() - 6) == "_score") {
+        float score = item.second.cast<float>();
+        snprintf(buf, sizeof(buf), "%-7s: %.2f", key.c_str(), score);
+        lines.emplace_back(buf);
+      }
+    }
+  }
+
+  // ── CLASSIFICATION: class_name (injected by Python) + score ───────────────
+  if (!is_attr) {
+    if (det.contains("class_name") && det.contains("score")) {
+      snprintf(buf, sizeof(buf), "%s  %.0f%%",
+               det["class_name"].cast<std::string>().c_str(),
+               det["score"].cast<float>() * 100.0f);
+      lines.emplace_back(buf);
+    } else if (det.contains("class_id") && det.contains("score")) {
+      // Fallback when Python didn't inject class_name
+      snprintf(buf, sizeof(buf), "cls%d  %.0f%%",
+               det["class_id"].cast<int>(),
+               det["score"].cast<float>() * 100.0f);
+      lines.emplace_back(buf);
+    } else {
+      return;
+    }
+  }
+
+  if (lines.empty()) return;
+
+  // Measure all lines to find bounding box
+  const double scale   = 0.45;
+  const int    padding = 5;
+  const int    line_gap = 4;
+  int baseline = 0;
+  int max_w = 0, line_h = 0;
+  for (const auto& l : lines) {
+    cv::Size ts = cv::getTextSize(l.c_str(), cv::FONT_HERSHEY_SIMPLEX,
+                                  scale, 1, &baseline);
+    if (ts.width > max_w) max_w = ts.width;
+    if (ts.height > line_h) line_h = ts.height;
+  }
+  int n       = (int)lines.size();
+  int bx1     = 8, by1 = 8;
+  int bx2     = bx1 + max_w + padding * 2;
+  int by2     = by1 + n * (line_h + line_gap) + baseline + padding;
+
+  int cls_id  = det.contains("class_id") ? det["class_id"].cast<int>() : 0;
+  YUVColor col = detectionColor(cls_id);
+
+  PlaneMapping m   = mapPlanes(vpss);
+  uint8_t text_Y   = (col.Y < 128) ? 235 : 16;
+
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, bx1, by1, bx2, by2, col, fw, fh);
+
+  for (int i = 0; i < n; ++i) {
+    int ty = by1 + padding + (i + 1) * (line_h + line_gap) - line_gap;
+    yuvBlitText(m.y_va, ys, lines[i].c_str(),
+                bx1 + padding, ty, scale, text_Y, col.Y, fw, fh);
+  }
+
+  CVI_SYS_IonFlushCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonFlushCache(m.uv_pa, m.uv_va, m.uv_len);
+}
+
+// ─── Draw Segmentation ────────────────────────────────────────────────────────
+//
+// Draws a semantic segmentation overlay (per-pixel color tint).
+// result: a list/dict with keys "output_width", "output_height", "class_id"
+// alpha: blend factor 0.0 (invisible) … 1.0 (opaque).  Default 0.5.
+// class_id == 0 is treated as background and left untouched.
+
+void drawSegmentation(PyImage& image, const py::object& result, float alpha) {
+  VPSSImage* vpss = requireVPSS(image, "draw_segmentation");
+  int fh = (int)vpss->getHeight(), fw = (int)vpss->getWidth();
+  auto st = vpss->getStrides();
+  int ys = (int)st[0], us = (int)st[1];
+  bool nv21 = (vpss->getImageFormat() == ImageFormat::YUV420SP_VU);
+
+  py::dict seg;
+  if (py::isinstance<py::list>(result)) {
+    py::list lst = result.cast<py::list>();
+    if (lst.empty()) return;
+    seg = lst[0].cast<py::dict>();
+  } else {
+    seg = result.cast<py::dict>();
+  }
+
+  if (!seg.contains("output_width") || !seg.contains("class_id")) return;
+  int sw = seg["output_width"].cast<int>();
+  int sh = seg["output_height"].cast<int>();
+  auto class_ids = seg["class_id"].cast<std::vector<int>>();
+  if ((int)class_ids.size() < sw * sh) return;
+
+  PlaneMapping m = mapPlanes(vpss);
+  CVI_SYS_IonInvalidateCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonInvalidateCache(m.uv_pa, m.uv_va, m.uv_len);
+
+  int ia = (int)(alpha * 256.0f + 0.5f);
+  int ib = 256 - ia;
+
+  for (int fy = 0; fy < fh; ++fy) {
+    int sy = fy * sh / fh;
+    for (int fx = 0; fx < fw; ++fx) {
+      int sx = fx * sw / fw;
+      int cls = class_ids[sy * sw + sx];
+      if (cls == 0) continue;
+      YUVColor c = detectionColor(cls - 1);
+      m.y_va[fy * ys + fx] =
+          (uint8_t)((ib * m.y_va[fy * ys + fx] + ia * c.Y) >> 8);
+      if ((fy & 1) == 0 && (fx & 1) == 0) {
+        uint8_t* uv = m.uv_va + (fy >> 1) * us + (fx & ~1);
+        if (nv21) {
+          uv[0] = (uint8_t)((ib * uv[0] + ia * c.V) >> 8);
+          uv[1] = (uint8_t)((ib * uv[1] + ia * c.U) >> 8);
+        } else {
+          uv[0] = (uint8_t)((ib * uv[0] + ia * c.U) >> 8);
+          uv[1] = (uint8_t)((ib * uv[1] + ia * c.V) >> 8);
+        }
+      }
+    }
+  }
+
+  CVI_SYS_IonFlushCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonFlushCache(m.uv_pa, m.uv_va, m.uv_len);
+}
+
+// ─── Draw Instance Segmentation ───────────────────────────────────────────────
+//
+// Draws bounding boxes + per-instance mask overlay.
+// result: a list/dict with keys "mask_width", "mask_height", "bboxes_seg"
+// alpha: mask blend factor (default 0.45).
+
+void drawInstanceSegmentation(PyImage& image, const py::object& result,
+                               float score_threshold, float alpha) {
+  VPSSImage* vpss = requireVPSS(image, "draw_instance_segmentation");
+  int fh = (int)vpss->getHeight(), fw = (int)vpss->getWidth();
+  auto st = vpss->getStrides();
+  int ys = (int)st[0], us = (int)st[1];
+  bool nv21 = (vpss->getImageFormat() == ImageFormat::YUV420SP_VU);
+
+  py::dict inst;
+  if (py::isinstance<py::list>(result)) {
+    py::list lst = result.cast<py::list>();
+    if (lst.empty()) return;
+    inst = lst[0].cast<py::dict>();
+  } else {
+    inst = result.cast<py::dict>();
+  }
+
+  if (!inst.contains("bboxes_seg")) return;
+  int mw = inst["mask_width"].cast<int>();
+  int mh = inst["mask_height"].cast<int>();
+  auto bboxes = inst["bboxes_seg"].cast<py::list>();
+
+  PlaneMapping m = mapPlanes(vpss);
+  CVI_SYS_IonInvalidateCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonInvalidateCache(m.uv_pa, m.uv_va, m.uv_len);
+
+  int ia = (int)(alpha * 256.0f + 0.5f);
+  int ib = 256 - ia;
+
+  for (auto item : bboxes) {
+    py::dict det = item.cast<py::dict>();
+    float score = det.contains("score") ? det["score"].cast<float>() : 1.0f;
+    if (score < score_threshold) continue;
+
+    int cls_id = det.contains("class_id") ? det["class_id"].cast<int>() : 0;
+    YUVColor col = detectionColor(cls_id);
+
+    int x1 = std::max(0,    (int)det["x1"].cast<float>());
+    int y1 = std::max(0,    (int)det["y1"].cast<float>());
+    int x2 = std::min(fw-1, (int)det["x2"].cast<float>());
+    int y2 = std::min(fh-1, (int)det["y2"].cast<float>());
+
+    // Bounding box
+    yuvDrawRect(m.y_va, m.uv_va, ys, us, nv21, x1, y1, x2, y2, 2, col, fw, fh);
+
+    // Label
+    if (det.contains("class_name")) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "%s %.2f",
+               det["class_name"].cast<std::string>().c_str(), score);
+      int baseline = 0;
+      cv::Size ts = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseline);
+      int lx = x1;
+      int ly = std::max(ts.height + baseline, y1 - 2);
+      yuvFillRect(m.y_va, m.uv_va, ys, us, nv21,
+                  lx, ly - ts.height - baseline, lx + ts.width + 2, ly + 2,
+                  col, fw, fh);
+      uint8_t text_Y = (col.Y < 128) ? 235 : 16;
+      yuvBlitText(m.y_va, ys, buf, lx + 1, ly, 0.4, text_Y, col.Y, fw, fh);
+    }
+
+    // Mask overlay (scaled from mask space to bbox space)
+    if (det.contains("mask") && mw > 0 && mh > 0) {
+      std::vector<float> mask_vals;
+      try {
+        mask_vals = det["mask"].cast<std::vector<float>>();
+      } catch (...) {
+        auto ml = det["mask"].cast<py::list>();
+        mask_vals.reserve(mw * mh);
+        for (auto v : ml)
+          try { mask_vals.push_back(v.cast<float>()); }
+          catch (...) { mask_vals.push_back((float)v.cast<int>()); }
+      }
+      if ((int)mask_vals.size() < mw * mh) continue;
+
+      int bw = x2 - x1, bh = y2 - y1;
+      if (bw <= 0 || bh <= 0) continue;
+
+      for (int fy = y1; fy < y2; ++fy) {
+        int my = (fy - y1) * mh / bh;
+        for (int fx = x1; fx < x2; ++fx) {
+          int mx = (fx - x1) * mw / bw;
+          if (mask_vals[my * mw + mx] < 0.5f) continue;
+          m.y_va[fy * ys + fx] =
+              (uint8_t)((ib * m.y_va[fy * ys + fx] + ia * col.Y) >> 8);
+          if ((fy & 1) == 0 && (fx & 1) == 0) {
+            uint8_t* uv = m.uv_va + (fy >> 1) * us + (fx & ~1);
+            if (nv21) {
+              uv[0] = (uint8_t)((ib * uv[0] + ia * col.V) >> 8);
+              uv[1] = (uint8_t)((ib * uv[1] + ia * col.U) >> 8);
+            } else {
+              uv[0] = (uint8_t)((ib * uv[0] + ia * col.U) >> 8);
+              uv[1] = (uint8_t)((ib * uv[1] + ia * col.V) >> 8);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  CVI_SYS_IonFlushCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonFlushCache(m.uv_pa, m.uv_va, m.uv_len);
+}
+
+// ─── Draw OCR ─────────────────────────────────────────────────────────────────
+//
+// Draws OCR text result at the bottom of the frame.
+// result: a list containing a string, as returned by OCR models.
+
+void drawOcr(PyImage& image, const py::object& result) {
+  VPSSImage* vpss = requireVPSS(image, "draw_ocr");
+  int fh = (int)vpss->getHeight(), fw = (int)vpss->getWidth();
+  auto st = vpss->getStrides();
+  int ys = (int)st[0], us = (int)st[1];
+  bool nv21 = (vpss->getImageFormat() == ImageFormat::YUV420SP_VU);
+
+  std::string text;
+  if (py::isinstance<py::list>(result)) {
+    py::list lst = result.cast<py::list>();
+    if (lst.empty()) return;
+    try { text = lst[0].cast<std::string>(); } catch (...) { return; }
+  } else if (py::isinstance<py::str>(result)) {
+    text = result.cast<std::string>();
+  } else {
+    return;
+  }
+  if (text.empty()) return;
+
+  static const YUVColor kBg = YUVColor::fromRGB(0, 0, 0);
+
+  double scale = 0.6;
+  int margin = 8;
+  int baseline = 0;
+  cv::Size ts = cv::getTextSize(text.c_str(), cv::FONT_HERSHEY_SIMPLEX,
+                                 scale, 1, &baseline);
+  int bx1 = margin;
+  int by2 = fh - margin;
+  int bx2 = std::min(fw - margin, bx1 + ts.width + 6);
+  int by1 = by2 - ts.height - baseline - 6;
+
+  PlaneMapping m = mapPlanes(vpss);
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, bx1, by1, bx2, by2, kBg, fw, fh);
+  yuvBlitText(m.y_va, ys, text.c_str(),
+              bx1 + 3, by2 - baseline - 3, scale, 235, 16, fw, fh);
   CVI_SYS_IonFlushCache(m.y_pa, m.y_va, m.y_len);
   CVI_SYS_IonFlushCache(m.uv_pa, m.uv_va, m.uv_len);
 }
@@ -395,19 +820,36 @@ void drawKeypoints(PyImage& image, const py::list& detections_with_landmarks,
 // quality: 0-100 JPEG quality (default 80).
 
 py::bytes frameToJpeg(const PyImage& image, int quality, float scale) {
-  VPSSImage* vpss = requireVPSS(image, "frame_to_jpeg");
+  requireVPSS(image, "frame_to_jpeg");
+
+#if defined(__CV181X__) || defined(__CV180X__) || defined(__CV182X__) || \
+    defined(__CV183X__) || defined(__CV184X__) || defined(__CV186X__)
+
+  // ── Hardware path (scale = 1.0 only) ────────────────────────────────────
+  // CVI_VENC encodes YUV420SP directly — no YUV→BGR conversion on the CPU.
+  // When scale < 1 we fall through to the SW path, which encodes at the
+  // smaller resolution directly (faster than HW encode + SW decode + resize).
+  if (scale >= 1.0f) {
+    std::vector<uint8_t> hw_buf;
+    if (hwJpegEncoder().encodeFrame(image.getImage(), hw_buf, 1, quality)) {
+      return py::bytes(reinterpret_cast<const char*>(hw_buf.data()), hw_buf.size());
+    }
+  }
+  // Fall through to software path (scale < 1 or HW encoder failure).
+
+#endif
+
+  // ── Software fallback (non-chip platforms or HW failure) ─────────────────
+  VPSSImage* vpss = dynamic_cast<VPSSImage*>(image.getImage().get());
   int fh = (int)vpss->getHeight(), fw = (int)vpss->getWidth();
   auto st = vpss->getStrides();
   int ys = (int)st[0], us = (int)st[1];
   bool nv21 = (vpss->getImageFormat() == ImageFormat::YUV420SP_VU);
 
   PlaneMapping m = mapPlanes(vpss);
-
-  // Invalidate CPU cache so we see data written by hardware (ISP/DMA).
   CVI_SYS_IonInvalidateCache(m.y_pa, m.y_va, m.y_len);
   CVI_SYS_IonInvalidateCache(m.uv_pa, m.uv_va, m.uv_len);
 
-  // Assemble a contiguous YUV420SP mat (height*3/2 rows, width cols, 1 ch).
   cv::Mat yuv(fh + fh / 2, fw, CV_8UC1);
   for (int row = 0; row < fh; ++row)
     std::memcpy(yuv.ptr(row), m.y_va + row * ys, fw);
@@ -417,7 +859,6 @@ py::bytes frameToJpeg(const PyImage& image, int quality, float scale) {
   cv::Mat bgr;
   cv::cvtColor(yuv, bgr, nv21 ? cv::COLOR_YUV2BGR_NV21 : cv::COLOR_YUV2BGR_NV12);
 
-  // Optional downscale — reduces JPEG encode time proportionally to pixel count.
   if (scale > 0.0f && scale < 1.0f) {
     cv::resize(bgr, bgr,
                cv::Size((int)(fw * scale), (int)(fh * scale)),
@@ -426,7 +867,6 @@ py::bytes frameToJpeg(const PyImage& image, int quality, float scale) {
 
   std::vector<uint8_t> buf;
   cv::imencode(".jpg", bgr, buf, {cv::IMWRITE_JPEG_QUALITY, quality});
-
   return py::bytes(reinterpret_cast<const char*>(buf.data()), buf.size());
 }
 

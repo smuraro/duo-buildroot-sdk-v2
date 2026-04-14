@@ -354,32 +354,33 @@ else
 fi
 
 # build start
-$CMAKE_BIN -G Ninja ${CVI_TDL_ROOT} -DCVI_PLATFORM=${CHIP_ARCH} \
-                                    -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
-                                    -DENABLE_CVI_TDL_CV_UTILS=${CV_UTILS} \
-                                    -DMLIR_SDK_ROOT=${TPU_SDK_INSTALL_PATH} \
-                                    -DISP_ROOT_DIR=${ISP_ROOT_DIR} \
-                                    -DOPENCV_ROOT_DIR=${OPENCV_ROOT_DIR} \
-                                    -DMIDDLEWARE_SDK_ROOT=${MPI_PATH} \
-                                    -DTPU_IVE_SDK_ROOT=${IVE_SDK_INSTALL_PATH} \
-                                    -DCMAKE_INSTALL_PREFIX=${TDL_SDK_INSTALL_PATH} \
-                                    -DTOOLCHAIN_ROOT_DIR=${HOST_TOOL_PATH} \
-                                    -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_FILE} \
-                                    -DUSE_TPU_IVE=${USE_TPU_IVE} \
-                                    -DBUILD_DOWNLOAD_DIR=${BUILD_DOWNLOAD_DIR} \
-                                    -DCONFIG_DUAL_OS=${CONFIG_DUAL_OS} \
-                                    -DBUILD_OPTION=${BUILD_OPTION} \
-                                    -DTARGET_MACHINE=${TARGET_MACHINE} \
-                                    -DMW_VER=${MW_VER} \
-                                    -DFTP_SERVER_IP=${FTP_SERVER_IP} \
-                                    -DFTP_SERVER_NAME=${FTP_SERVER_NAME} \
-                                    -DFTP_SERVER_PWD=${FTP_SERVER_PWD} \
-                                    -DBUILD_SHARED=${BUILD_SHARED} \
-                                    -DOSS_TARBALL_PATH=${OSS_TARBALL_PATH} \
-                                    -DENABLE_OPENCV_4_5=${ENABLE_OPENCV_4_5}
-
-
-test $? -ne 0 && echo "cmake tdl_sdk failed !!" && popd && exit 1
+# Run cmake only on first build; ninja handles re-configuration when cmake files change
+if [ ! -f "${BUILD_WORKING_DIR}/CMakeCache.txt" ]; then
+    $CMAKE_BIN -G Ninja ${CVI_TDL_ROOT} -DCVI_PLATFORM=${CHIP_ARCH} \
+                                        -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+                                        -DENABLE_CVI_TDL_CV_UTILS=${CV_UTILS} \
+                                        -DMLIR_SDK_ROOT=${TPU_SDK_INSTALL_PATH} \
+                                        -DISP_ROOT_DIR=${ISP_ROOT_DIR} \
+                                        -DOPENCV_ROOT_DIR=${OPENCV_ROOT_DIR} \
+                                        -DMIDDLEWARE_SDK_ROOT=${MPI_PATH} \
+                                        -DTPU_IVE_SDK_ROOT=${IVE_SDK_INSTALL_PATH} \
+                                        -DCMAKE_INSTALL_PREFIX=${TDL_SDK_INSTALL_PATH} \
+                                        -DTOOLCHAIN_ROOT_DIR=${HOST_TOOL_PATH} \
+                                        -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_FILE} \
+                                        -DUSE_TPU_IVE=${USE_TPU_IVE} \
+                                        -DBUILD_DOWNLOAD_DIR=${BUILD_DOWNLOAD_DIR} \
+                                        -DCONFIG_DUAL_OS=${CONFIG_DUAL_OS} \
+                                        -DBUILD_OPTION=${BUILD_OPTION} \
+                                        -DTARGET_MACHINE=${TARGET_MACHINE} \
+                                        -DMW_VER=${MW_VER} \
+                                        -DFTP_SERVER_IP=${FTP_SERVER_IP} \
+                                        -DFTP_SERVER_NAME=${FTP_SERVER_NAME} \
+                                        -DFTP_SERVER_PWD=${FTP_SERVER_PWD} \
+                                        -DBUILD_SHARED=${BUILD_SHARED} \
+                                        -DOSS_TARBALL_PATH=${OSS_TARBALL_PATH} \
+                                        -DENABLE_OPENCV_4_5=${ENABLE_OPENCV_4_5}
+    test $? -ne 0 && echo "cmake tdl_sdk failed !!" && popd && exit 1
+fi
 
 ninja -j8 || exit 1
 ninja install || exit 1

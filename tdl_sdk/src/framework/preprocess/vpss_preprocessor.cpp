@@ -222,6 +222,24 @@ std::shared_ptr<BaseImage> VpssPreprocessor::preprocess(
 int32_t VpssPreprocessor::prepareVPSSParams(
     const std::shared_ptr<BaseImage>& src_image,
     const PreprocessParams& params) {
+  // Fast-path: skip the 5 IOCTL calls if nothing changed since last frame.
+  // For streaming video (fixed resolution/format) this is the common case.
+  const uint32_t sw = src_image->getWidth();
+  const uint32_t sh = src_image->getHeight();
+  const int sfmt    = static_cast<int>(src_image->getImageFormat());
+  const bool same =
+      vpss_params_valid_ &&
+      sw == cached_src_w_ && sh == cached_src_h_ && sfmt == cached_src_fmt_ &&
+      params.dst_width      == cached_dst_w_   &&
+      params.dst_height     == cached_dst_h_   &&
+      static_cast<int>(params.dst_image_format) == cached_dst_fmt_ &&
+      static_cast<int>(params.dst_pixdata_type)  == cached_dst_dtype_ &&
+      params.use_nearest_resize == cached_nearest_;
+
+  if (same) {
+    return 0;
+  }
+
   VPSS_GRP_ATTR_S vpss_grp_attr;
   VPSS_CROP_INFO_S vpss_chn_crop_attr;
   VPSS_CHN_ATTR_S vpss_chn_attr;
@@ -261,6 +279,17 @@ int32_t VpssPreprocessor::prepareVPSSParams(
     LOGE("CVI_VPSS_SetChnScaleCoefLevel failed with %#x\n", ret);
     return -1;
   }
+
+  // Update cache
+  cached_src_w_     = sw;
+  cached_src_h_     = sh;
+  cached_src_fmt_   = sfmt;
+  cached_dst_w_     = params.dst_width;
+  cached_dst_h_     = params.dst_height;
+  cached_dst_fmt_   = static_cast<int>(params.dst_image_format);
+  cached_dst_dtype_ = static_cast<int>(params.dst_pixdata_type);
+  cached_nearest_   = params.use_nearest_resize;
+  vpss_params_valid_ = true;
   return 0;
 }
 
@@ -453,16 +482,26 @@ int32_t VpssPreprocessor::preprocessToTensor(
   std::vector<uint32_t> strides = vpss_image->getStrides();
   int32_t ret = 0;
   uint32_t tensor_stride = tensor->getWidth() * tensor->getElementSize();
+
+  // Reset zero-copy state from previous call
+  last_output_paddr_ = 0;
+  last_output_image_.reset();
+
   if (strides[0] == tensor_stride) {
-    LOGI("vpss preprocessor, construct image from input tensor");
+    // Strides match: make VPSS write directly into the tensor's ION buffer
+    // (zero-copy path — no memcpy needed).
+    LOGI("vpss preprocessor, construct image from input tensor (zero-copy)");
     ret = tensor->constructImage(vpss_image, batch_idx);
     if (ret != 0) {
       LOGE("tensor constructImage failed, ret: %d\n", ret);
       return -1;
     }
   } else {
-    LOGI("vpss preprocessor, image stride:%d, tensor stride:%d", strides[0],
-         tensor_stride);
+    // Strides differ: allocate a separate ION buffer for the VPSS output.
+    // After preprocessing we expose its physical address so the caller can
+    // use CVI_NN_SetTensorPhysicalAddr to avoid the CPU memcpy.
+    LOGI("vpss preprocessor, image stride:%d, tensor stride:%d — alloc separate buffer",
+         strides[0], tensor_stride);
     ret = vpss_image->allocateMemory();
     if (ret != 0) {
       LOGE("vpss_image allocateMemory failed, ret: %d\n", ret);
@@ -483,14 +522,30 @@ int32_t VpssPreprocessor::preprocessToTensor(
     LOGE("preprocessToImage failed, ret: %d\n", ret);
     return -1;
   }
-  if (strides[0] != tensor->getWidth()) {
-    // copy vpss image to tensor
-    LOGI("copy vpss image to tensor");
-    vpss_image->invalidateCache();
-    ret = tensor->copyFromImage(vpss_image, batch_idx);
-    if (ret != 0) {
-      LOGE("tensor copyFromImage failed, ret: %d\n", ret);
-      return -1;
+
+  if (strides[0] != tensor_stride) {
+    auto paddr_vec = vpss_image->getPhysicalAddress();
+    if (!paddr_vec.empty() && paddr_vec[0] != 0) {
+      last_output_paddr_ = paddr_vec[0];
+      last_output_image_ = vpss_image;  // extends lifetime past this call
+    }
+
+    bool skip_copy = zero_copy_hint_ && (last_output_paddr_ != 0);
+    zero_copy_hint_ = false;  // consume the hint — always reset
+
+    if (skip_copy) {
+      // Zero-copy: caller will redirect the TPU tensor's physical address to
+      // last_output_paddr_ via CviNet::setInputTensorPhysicalAddr.
+      LOGI("zero-copy: skipping copyFromImage, paddr=0x%llx", last_output_paddr_);
+    } else {
+      // Standard path: copy VPSS output into the tensor's own ION buffer.
+      LOGI("copy vpss image to tensor");
+      vpss_image->invalidateCache();
+      ret = tensor->copyFromImage(vpss_image, batch_idx);
+      if (ret != 0) {
+        LOGE("tensor copyFromImage failed, ret: %d\n", ret);
+        return -1;
+      }
     }
   }
   return ret;

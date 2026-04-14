@@ -23,10 +23,18 @@ class PyModel {
 
   virtual ~PyModel() = default;
 
+  // Explicitly release the underlying model and its VPSS preprocessor group.
+  // Call this before the script exits to avoid exhausting VPSS groups across
+  // multiple script runs (the kernel does not release groups on process exit
+  // unless destructors run cleanly).
+  void close() { model_.reset(); }
+
   py::dict getPreprocessParameters();
 
   void setThreshold(float threshold);
   float getThreshold() const;
+  void setSoftNms(bool enable, float sigma = 0.5f);
+  bool getSoftNms() const;
   std::vector<std::string> getInputNames() const;
   std::vector<std::string> getOutputNames() const;
 

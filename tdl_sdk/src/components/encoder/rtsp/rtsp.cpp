@@ -1,18 +1,25 @@
 #include "encoder/rtsp/rtsp.hpp"
 #include "utils/tdl_log.hpp"
 
-#define FRAME_MILLISEC 20000
+// Shared RTSP server singleton — all instances share one CVI_RTSP_CTX on
+// port 554; each adds its own session.  Destroyed when the last instance is
+// released.
+std::mutex     RTSP::s_rtsp_mutex_;
+CVI_RTSP_CTX*  RTSP::s_rtsp_ctx_      = nullptr;
+int            RTSP::s_rtsp_refcount_ = 0;
+
+#define FRAME_MILLISEC 2000
 #define RTSP_PORT 554
 #define MaxPicWidth 2560
 #define MaxPicHeight 1440
-#define BufSize 1024 * 1024
+#define BufSize (4 * 1024 * 1024)
 #define Profile 0
 #define IPQpDelta 2
-#define Gop 25
-#define StatTime 2
+#define Gop 15
+#define StatTime 1
 #define DstFrameRate 25
 #define SrcFrameRate 25
-#define BitRate 1024
+#define BitRate 3072
 
 void RTSP::onRTSPConnect(const char *ip, void *arg) {
   LOGI("RTSP client connected from: %s\n", ip);
@@ -47,20 +54,20 @@ int32_t RTSP::initVENC() {
     venc_chn_attr.stVencAttr.stAttrH264e.bSingleLumaBuf = CVI_FALSE;
     venc_chn_attr.stVencAttr.stAttrH264e.bRcnRefShareBuf = CVI_FALSE;
     venc_chn_attr.stRcAttr.enRcMode = VENC_RC_MODE_H264CBR;
-    venc_chn_attr.stRcAttr.stH264Cbr.u32Gop = Gop;
+    venc_chn_attr.stRcAttr.stH264Cbr.u32Gop = context_.gop;
     venc_chn_attr.stRcAttr.stH264Cbr.u32StatTime = StatTime;
-    venc_chn_attr.stRcAttr.stH264Cbr.fr32DstFrameRate = DstFrameRate;
-    venc_chn_attr.stRcAttr.stH264Cbr.u32SrcFrameRate = SrcFrameRate;
-    venc_chn_attr.stRcAttr.stH264Cbr.u32BitRate = BitRate;
+    venc_chn_attr.stRcAttr.stH264Cbr.fr32DstFrameRate = context_.frame_rate;
+    venc_chn_attr.stRcAttr.stH264Cbr.u32SrcFrameRate = context_.frame_rate;
+    venc_chn_attr.stRcAttr.stH264Cbr.u32BitRate = context_.bitrate;
     venc_chn_attr.stRcAttr.stH264Cbr.bVariFpsEn = CVI_FALSE;
   } else if (venc_chn_attr.stVencAttr.enType == PT_H265) {
     venc_chn_attr.stVencAttr.stAttrH265e.bRcnRefShareBuf = CVI_FALSE;
     venc_chn_attr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
-    venc_chn_attr.stRcAttr.stH265Cbr.u32Gop = Gop;
+    venc_chn_attr.stRcAttr.stH265Cbr.u32Gop = context_.gop;
     venc_chn_attr.stRcAttr.stH265Cbr.u32StatTime = StatTime;
-    venc_chn_attr.stRcAttr.stH265Cbr.u32SrcFrameRate = SrcFrameRate;
-    venc_chn_attr.stRcAttr.stH265Cbr.fr32DstFrameRate = DstFrameRate;
-    venc_chn_attr.stRcAttr.stH265Cbr.u32BitRate = BitRate;
+    venc_chn_attr.stRcAttr.stH265Cbr.u32SrcFrameRate = context_.frame_rate;
+    venc_chn_attr.stRcAttr.stH265Cbr.fr32DstFrameRate = context_.frame_rate;
+    venc_chn_attr.stRcAttr.stH265Cbr.u32BitRate = context_.bitrate;
     venc_chn_attr.stRcAttr.stH265Cbr.bVariFpsEn = CVI_FALSE;
   } else {
     return -1;
@@ -110,15 +117,34 @@ int32_t RTSP::destroyVENC() {
 }
 
 int32_t RTSP::initRTSP() {
-  CVI_RTSP_CONFIG rtsp_config = {0};
-  rtsp_config.port = RTSP_PORT;
+  std::lock_guard<std::mutex> lk(s_rtsp_mutex_);
 
-  int32_t ret = CVI_RTSP_Create(&context_.pstRtspContext, &rtsp_config);
-  if (ret != 0) {
-    LOGE("Failed to create RTSP session");
-    return ret;
+  // Create the shared RTSP server on port 554 only on the first instance.
+  if (s_rtsp_ctx_ == nullptr) {
+    CVI_RTSP_CONFIG rtsp_config = {0};
+    rtsp_config.port = RTSP_PORT;
+    int32_t ret = CVI_RTSP_Create(&s_rtsp_ctx_, &rtsp_config);
+    if (ret != 0) {
+      LOGE("Failed to create RTSP server (port %d)", RTSP_PORT);
+      return ret;
+    }
+    CVI_RTSP_STATE_LISTENER listener;
+    listener.onConnect    = onRTSPConnect;
+    listener.argConn      = s_rtsp_ctx_;
+    listener.onDisconnect = onRTSPDisconnect;
+    CVI_RTSP_SetListener(s_rtsp_ctx_, &listener);
+    ret = CVI_RTSP_Start(s_rtsp_ctx_);
+    if (ret != 0) {
+      LOGE("Failed to start RTSP server");
+      CVI_RTSP_Destroy(&s_rtsp_ctx_);
+      s_rtsp_ctx_ = nullptr;
+      return ret;
+    }
   }
+  context_.pstRtspContext = s_rtsp_ctx_;
+  s_rtsp_refcount_++;
 
+  // Add a session for this channel.
   CVI_RTSP_SESSION_ATTR attr = {0};
   if (context_.pay_load_type == PT_H264) {
     attr.video.codec = RTSP_VIDEO_H264;
@@ -132,22 +158,10 @@ int32_t RTSP::initRTSP() {
     return -1;
   }
 
-  ret = CVI_RTSP_CreateSession(context_.pstRtspContext, &attr,
-                               &context_.pstSession);
+  int32_t ret = CVI_RTSP_CreateSession(context_.pstRtspContext, &attr,
+                                        &context_.pstSession);
   if (ret != 0) {
-    LOGE("Failed to create RTSP session");
-    return ret;
-  }
-
-  CVI_RTSP_STATE_LISTENER listener;
-  listener.onConnect = onRTSPConnect;
-  listener.argConn = context_.pstRtspContext;
-  listener.onDisconnect = onRTSPDisconnect;
-  CVI_RTSP_SetListener(context_.pstRtspContext, &listener);
-
-  ret = CVI_RTSP_Start(context_.pstRtspContext);
-  if (ret != 0) {
-    LOGE("Failed to start RTSP");
+    LOGE("Failed to create RTSP session '%s'", attr.name);
     return ret;
   }
 
@@ -155,22 +169,26 @@ int32_t RTSP::initRTSP() {
 }
 
 int32_t RTSP::destroyRTSP() {
-  int32_t ret = CVI_RTSP_Stop(context_.pstRtspContext);
-  if (ret != 0) {
-    LOGE("Failed to destroy RTSP session");
-    return ret;
+  std::lock_guard<std::mutex> lk(s_rtsp_mutex_);
+
+  if (context_.pstSession && context_.pstRtspContext) {
+    CVI_RTSP_DestroySession(context_.pstRtspContext, context_.pstSession);
+    context_.pstSession = nullptr;
   }
 
-  ret = CVI_RTSP_DestroySession(context_.pstRtspContext, context_.pstSession);
-  if (ret != 0) {
-    LOGE("Failed to destroy RTSP session");
-    return ret;
+  s_rtsp_refcount_--;
+  if (s_rtsp_refcount_ <= 0 && s_rtsp_ctx_ != nullptr) {
+    CVI_RTSP_Stop(s_rtsp_ctx_);
+    CVI_RTSP_Destroy(&s_rtsp_ctx_);
+    s_rtsp_ctx_      = nullptr;
+    s_rtsp_refcount_ = 0;
   }
   return 0;
 }
 
 RTSP::RTSP(int32_t chn, PAYLOAD_TYPE_E pay_load_type, int32_t frame_width,
-           int32_t frame_height, const std::string& session_name) {
+           int32_t frame_height, const std::string& session_name,
+           int32_t bitrate, int32_t gop, int32_t frame_rate) {
   // 初始化RTSP上下文
   context_.chn = chn;
   context_.pay_load_type = pay_load_type;
@@ -179,6 +197,9 @@ RTSP::RTSP(int32_t chn, PAYLOAD_TYPE_E pay_load_type, int32_t frame_width,
   context_.session_name = session_name;
   context_.pstRtspContext = nullptr;
   context_.pstSession = nullptr;
+  context_.bitrate     = bitrate > 0 ? bitrate : BitRate;
+  context_.gop        = gop > 0 ? gop : Gop;
+  context_.frame_rate = (frame_rate > 0 && frame_rate <= 120) ? frame_rate : DstFrameRate;
 
   // 初始化VENC和RTSP
   if (initVENC() != 0) {
@@ -220,8 +241,20 @@ int32_t RTSP::sendFrame(VIDEO_FRAME_INFO_S *frame) {
       (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S) * venc_chn_status.u32CurPacks);
   ret = CVI_VENC_GetStream(chn, &stream, FRAME_MILLISEC);
   if (ret != 0) {
-    LOGE("Failed to get VENC stream");
+    LOGE("Failed to get VENC stream (ret=0x%x) — flushing buffer", ret);
     free(stream.pstPack);
+    // Flush any stale encoded data so the buffer does not stay full and block
+    // subsequent SendFrame calls.
+    VENC_CHN_STATUS_S st;
+    if (CVI_VENC_QueryStatus(chn, &st) == 0 && st.u32CurPacks > 0) {
+      VENC_PACK_S *flush_pack =
+          (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S) * st.u32CurPacks);
+      VENC_STREAM_S flush_stream;
+      flush_stream.pstPack = flush_pack;
+      if (CVI_VENC_GetStream(chn, &flush_stream, 0) == 0)
+        CVI_VENC_ReleaseStream(chn, &flush_stream);
+      free(flush_pack);
+    }
     return ret;
   }
 

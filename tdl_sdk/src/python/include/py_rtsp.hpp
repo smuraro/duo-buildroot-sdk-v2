@@ -25,9 +25,14 @@ class PyRTSP {
  public:
   // codec: "h264" (default) or "h265"
   // session_name: URL path component, default = codec name ("h264"/"h265")
+  // bitrate: encoding bitrate in kbps (default 3072).  Higher = better quality
+  //          during motion but more bandwidth. 1024–8192 kbps typical range.
+  // gop: keyframe interval in frames (default 15). Smaller = sharper during
+  //      motion, larger = better compression for static scenes.
   PyRTSP(int32_t width, int32_t height, int32_t chn = 0,
          const std::string& codec = "h264",
-         const std::string& session_name = "");
+         const std::string& session_name = "",
+         int32_t bitrate = 3072, int32_t gop = 15, int32_t fps = 25);
   ~PyRTSP();
 
   // Send a hardware camera frame (must be a VPSSImage from Camera.read()).
@@ -78,6 +83,27 @@ py::bytes frameToJpeg(const PyImage& image, int quality, float scale);
 // COCO-17 skeleton connectivity is used when 17 keypoints are present.
 void drawKeypoints(PyImage& image, const py::list& detections_with_landmarks,
                    float score_threshold);
+
+// Draw a classification / attribute result (CLASSIFICATION, CLS_ATTRIBUTE).
+// result: list or dict returned by model.inference().
+// Renders a filled label box in the top-left corner.
+void drawClassification(PyImage& image, const py::object& result);
+
+// Draw a semantic segmentation overlay (SEGMENTATION).
+// result: list/dict with keys "output_width", "output_height", "class_id".
+// alpha: blend 0.0 (invisible) … 1.0 (opaque), default 0.5.
+void drawSegmentation(PyImage& image, const py::object& result, float alpha);
+
+// Draw instance segmentation: bounding boxes + per-instance mask overlays
+// (OBJECT_DETECTION_WITH_SEGMENTATION).
+// result: list/dict with keys "mask_width", "mask_height", "bboxes_seg".
+// alpha: mask blend factor, default 0.45.
+void drawInstanceSegmentation(PyImage& image, const py::object& result,
+                               float score_threshold, float alpha);
+
+// Draw OCR text result at the bottom of the frame (OCR_INFO).
+// result: list containing a string, as returned by OCR models.
+void drawOcr(PyImage& image, const py::object& result);
 
 }  // namespace pytdl
 #endif  // PYTHON_RTSP_HPP_

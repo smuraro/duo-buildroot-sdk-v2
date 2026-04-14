@@ -5,6 +5,7 @@
 #include <cvi_venc.h>
 #include <rtsp.h>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 
 struct RTSPContext {
@@ -15,13 +16,17 @@ struct RTSPContext {
   std::string session_name;
   CVI_RTSP_CTX *pstRtspContext;
   CVI_RTSP_SESSION *pstSession;
+  int32_t bitrate    = 3072;  // kbps
+  int32_t gop        = 15;   // keyframe interval in frames
+  int32_t frame_rate = 25;   // src/dst frame rate (must match actual send rate)
 };
 
 class RTSP {
  public:
   RTSP(int32_t chn = 0, PAYLOAD_TYPE_E pay_load_type = PT_H264,
        int32_t frame_width = 1920, int32_t frame_height = 1080,
-       const std::string& session_name = "");
+       const std::string& session_name = "",
+       int32_t bitrate = 3072, int32_t gop = 15, int32_t frame_rate = 25);
   ~RTSP();
 
   int32_t sendFrame(VIDEO_FRAME_INFO_S *frame);
@@ -34,6 +39,12 @@ class RTSP {
   int32_t destroyVENC();
   int32_t initRTSP();
   int32_t destroyRTSP();
+
+  // Shared RTSP server (port 554 singleton): all RTSP instances add sessions
+  // to the same CVI_RTSP_CTX rather than each trying to bind port 554.
+  static std::mutex       s_rtsp_mutex_;
+  static CVI_RTSP_CTX*   s_rtsp_ctx_;
+  static int              s_rtsp_refcount_;
 
  private:
   RTSPContext context_;

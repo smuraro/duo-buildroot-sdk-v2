@@ -33,6 +33,15 @@ class DetectionHelper {
   static void nmsObjects(std::vector<ObjectBoxLandmarkInfo> &objects,
                          float iou_threshold,
                          std::vector<std::pair<int, uint32_t>> &stride_index);
+
+  // Soft NMS (Bodla et al., 2017): decays scores of overlapping boxes instead
+  // of hard-removing them. Reduces false negatives for nearby/overlapping
+  // objects. sigma controls the Gaussian decay: score *= exp(-iou²/sigma).
+  // Boxes whose score falls below score_threshold after decay are removed.
+  static void softNmsObjects(std::vector<ObjectBoxInfo> &objects,
+                             float score_threshold, float sigma = 0.5f);
+  static void softNmsObjects(std::map<int, std::vector<ObjectBoxInfo>> &bboxes,
+                             float score_threshold, float sigma = 0.5f);
   static void rescaleBbox(ObjectBoxInfo &bbox,
                           const std::vector<float> &scale_params);
   static void rescaleBbox(ObjectBoxSegmentationInfo &bbox,

@@ -10,7 +10,10 @@ py::list PyModel::inference(const PyImage& image) {
   std::vector<std::shared_ptr<BaseImage>> images;
   images.push_back(image.getImage());
   std::vector<std::shared_ptr<ModelOutputInfo>> out_datas;
-  model_->inference(images, out_datas);
+  {
+    py::gil_scoped_release release;   // libera GIL durante VPSS + NPU
+    model_->inference(images, out_datas);
+  }  // GIL re-adquirido aqui
   return outputParse(out_datas);
 }
 
@@ -28,7 +31,10 @@ py::list PyModel::inference(const PyImage& image, const py::dict& parameters) {
   std::vector<std::shared_ptr<BaseImage>> images;
   images.push_back(image.getImage());
   std::vector<std::shared_ptr<ModelOutputInfo>> out_datas;
-  model_->inference(images, out_datas, params);
+  {
+    py::gil_scoped_release release;   // libera GIL durante VPSS + NPU
+    model_->inference(images, out_datas, params);
+  }  // GIL re-adquirido aqui
   return outputParse(out_datas);
 }
 
@@ -37,6 +43,12 @@ void PyModel::setThreshold(float threshold) {
 }
 
 float PyModel::getThreshold() const { return model_->getModelThreshold(); }
+
+void PyModel::setSoftNms(bool enable, float sigma) {
+  model_->setSoftNms(enable, sigma);
+}
+
+bool PyModel::getSoftNms() const { return model_->getSoftNms(); }
 
 std::vector<std::string> PyModel::getInputNames() const {
   return model_->getInputNames();
@@ -116,15 +128,15 @@ py::list PyModel::outputParse(
     if (!classification_output) {
       throw std::runtime_error("Failed to cast to ModelClassificationInfo");
     }
-    py::dict classification_dict;
-
-    classification_dict[py::str("class_id")] =
-        classification_output->topk_class_ids[0];
-    classification_dict[py::str("score")] =
-        classification_output->topk_scores[0];
-
     py::list result;
-    result.append(classification_dict);
+    // Export all top-k results so Python can resolve class names via labels
+    size_t n = classification_output->topk_class_ids.size();
+    for (size_t i = 0; i < n; ++i) {
+      py::dict d;
+      d[py::str("class_id")] = classification_output->topk_class_ids[i];
+      d[py::str("score")]    = classification_output->topk_scores[i];
+      result.append(d);
+    }
     return result;
   } else if (output_info->getType() == ModelOutputType::CLS_ATTRIBUTE) {
     std::shared_ptr<ModelAttributeInfo> attribute_output =
@@ -132,38 +144,47 @@ py::list PyModel::outputParse(
     if (!attribute_output) {
       throw std::runtime_error("Failed to cast to ModelAttributeInfo");
     }
-    std::shared_ptr<ModelAttributeInfo> box_attribute_output =
-        std::dynamic_pointer_cast<ModelAttributeInfo>(output_info);
-    if (!box_attribute_output) {
-      throw std::runtime_error("Failed to cast to ModelAttributeInfo");
+
+    // Map every TDLObjectAttributeType value that appears in the attributes
+    // map to a human-readable name.  New attributes added to the enum are
+    // picked up automatically via the "unknown_<id>" fallback.
+    static const std::map<int, std::string> kAttrName = {
+        {OBJECT_ATTRIBUTE_HUMAN_GENDER,         "gender"},
+        {OBJECT_ATTRIBUTE_HUMAN_AGE,            "age"},
+        {OBJECT_ATTRIBUTE_HUMAN_MASK,           "mask"},
+        {OBJECT_ATTRIBUTE_HUMAN_HAT,            "hat"},
+        {OBJECT_ATTRIBUTE_HUMAN_GLASSES,        "glasses"},
+        {OBJECT_ATTRIBUTE_HUMAN_EMOTION,        "emotion"},
+        {OBJECT_ATTRIBUTE_HUMAN_POSE,           "pose"},
+        {OBJECT_CLS_ATTRIBUTE_FACE_BLURNESS,    "blurness"},
+    };
+
+    py::dict d;
+    // Preserve insertion order by iterating in enum-value order
+    for (const auto& kv : attribute_output->attributes) {
+      auto it = kAttrName.find(static_cast<int>(kv.first));
+      std::string name = (it != kAttrName.end())
+                         ? it->second
+                         : ("attr_" + std::to_string(static_cast<int>(kv.first)));
+      float score = kv.second;
+      d[py::str(name + "_score")] = score;
+
+      if (name == "gender") {
+        d[py::str("is_male")] = py::bool_(score > 0.5f);
+      } else if (name == "age") {
+        d[py::str("age")] = static_cast<int>(score * 100.f);
+      } else if (name == "mask") {
+        d[py::str("is_wearing_mask")] = py::bool_(score > 0.5f);
+      } else if (name == "hat") {
+        d[py::str("is_wearing_hat")] = py::bool_(score > 0.5f);
+      } else if (name == "glasses") {
+        d[py::str("is_wearing_glasses")] = py::bool_(score > 0.5f);
+      }
+      // emotion / pose / blurness / unknown: raw score is enough
     }
-    py::dict face_attribute_dict;
 
-    float mask_score =
-        box_attribute_output->attributes[OBJECT_ATTRIBUTE_HUMAN_MASK];
-    float gender_score =
-        box_attribute_output->attributes[OBJECT_ATTRIBUTE_HUMAN_GENDER];
-    float age_score =
-        box_attribute_output->attributes[OBJECT_ATTRIBUTE_HUMAN_AGE];
-    float glass_score =
-        box_attribute_output->attributes[OBJECT_ATTRIBUTE_HUMAN_GLASSES];
-
-    face_attribute_dict[py::str("mask_score")] = mask_score;
-    face_attribute_dict[py::str("is_wearing_mask")] =
-        (mask_score > 0.5) ? py::bool_(true) : py::bool_(false);
-
-    face_attribute_dict[py::str("gender_score")] = gender_score;
-    face_attribute_dict[py::str("is_male")] =
-        (gender_score > 0.5) ? py::bool_(true) : py::bool_(false);
-
-    face_attribute_dict[py::str("age_score")] = age_score;
-    face_attribute_dict[py::str("age")] = int(age_score * 100);
-
-    face_attribute_dict[py::str("glass_score")] = glass_score;
-    face_attribute_dict[py::str("is_wearing_glasses")] =
-        (glass_score > 0.5) ? py::bool_(true) : py::bool_(false);
     py::list result;
-    result.append(face_attribute_dict);
+    result.append(d);
     return result;
   } else if (output_info->getType() == ModelOutputType::OBJECT_LANDMARKS) {
     std::shared_ptr<ModelLandmarksInfo> box_landmark_info =
@@ -298,27 +319,6 @@ py::list PyModel::outputParse(
     std::string str(char_output->text_info);
     char_list.append(str);
     return char_list;
-  } else if (output_info->getType() ==
-             ModelOutputType::OBJECT_DETECTION_WITH_LANDMARKS) {
-    std::shared_ptr<ModelBoxLandmarkInfo> lane_output =
-        std::dynamic_pointer_cast<ModelBoxLandmarkInfo>(output_info);
-    if (!lane_output) {
-      throw std::runtime_error("Failed to cast to ModelBoxLandmarkInfo");
-    }
-    py::list lanes_list;
-    for (size_t j = 0; j < lane_output->box_landmarks.size(); j++) {
-      py::list landmarks;
-      for (int k = 0; k < 2; k++) {
-        py::list landmark;
-        landmark.append(lane_output->box_landmarks[j].landmarks_x[k]);
-        landmark.append(lane_output->box_landmarks[j].landmarks_y[k]);
-        landmarks.append(landmark);
-      }
-      lanes_list.append(landmarks);
-    }
-    py::list result;
-    result.append(lanes_list);
-    return result;
   } else {
     throw std::runtime_error("Model output type is not supported");
   }

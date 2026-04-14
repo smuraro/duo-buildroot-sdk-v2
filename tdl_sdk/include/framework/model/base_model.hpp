@@ -77,6 +77,10 @@ class BaseModel {
   // Override to apply additional per-batch input tensor transforms.
   virtual void postPreprocess(std::shared_ptr<BaseTensor> /*tensor*/,
                               int /*batch_idx*/) {}
+  // Return true if this model overrides postPreprocess with non-trivial work.
+  // Used by the zero-copy path in base_model.cpp to decide whether to skip
+  // the CPU memcpy (safe only when postPreprocess is a no-op).
+  virtual bool needsPostPreprocess() const { return false; }
 
   void setTypeMapping(const std::map<int, TDLObjectType>& type_mapping);
   void setClassNameMap(const std::map<int, std::string>& class_name_map);
@@ -84,6 +88,15 @@ class BaseModel {
   virtual void setModelThreshold(float threshold);
   virtual void setExportFeature(int flag);
   virtual float getModelThreshold() const { return model_threshold_; }
+
+  // Soft NMS: when enabled, overlapping boxes have their scores decayed by
+  // exp(-iou^2/sigma) instead of being hard-removed. Improves recall for
+  // nearby/overlapping objects. sigma=0.5 is the paper's default.
+  void setSoftNms(bool enable, float sigma = 0.5f) {
+    use_soft_nms_ = enable;
+    soft_nms_sigma_ = sigma;
+  }
+  bool getSoftNms() const { return use_soft_nms_; }
 
   int32_t getPreprocessParameters(PreprocessParams& pre_param,
                                   const std::string& input_name = "");
@@ -115,6 +128,8 @@ class BaseModel {
   std::string output_layer_;
   float model_threshold_ = 0.5;
   int export_feature = 0;
+  bool use_soft_nms_ = false;
+  float soft_nms_sigma_ = 0.5f;
 
   std::map<std::string, std::vector<std::vector<float>>> batch_rescale_params_;
 
