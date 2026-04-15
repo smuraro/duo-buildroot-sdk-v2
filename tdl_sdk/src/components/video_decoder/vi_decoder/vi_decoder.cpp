@@ -610,7 +610,10 @@ int32_t ViDecoder::deinitialize() {
   ViNum = g_stViConfig.s32WorkingViNum;
 #endif
 
-  // Always drain frames held by this instance first.
+  // Drain frames held by this instance — but only if the VPSS groups are still
+  // alive.  If vi_decoder_cleanup() has already been called (s_isp_alive=false)
+  // the VPSS groups are destroyed and CVI_VPSS_ReleaseChnFrame would fail with
+  // "Grp not yet started"; skip the drain in that case and just clear the queue.
   for (int32_t i = 0; i < ViNum; i++) {
     int32_t grp = (i < (int32_t)vpss_grps_.size()) ? vpss_grps_[i] : i;
     std::unique_lock<std::mutex> lock(queueMutexes[i]);
@@ -623,7 +626,9 @@ int32_t ViDecoder::deinitialize() {
                          frame_info->stVFrame.u32Length[j]);
         }
       }
-      CVI_VPSS_ReleaseChnFrame(grp, VPSS_CHN0, frame_info.get());
+      if (s_isp_alive) {
+        CVI_VPSS_ReleaseChnFrame(grp, VPSS_CHN0, frame_info.get());
+      }
     }
   }
 
@@ -705,6 +710,7 @@ int32_t ViDecoder::read(std::shared_ptr<BaseImage> &image, int32_t vi_chn) {
 
   std::lock_guard<std::mutex> lock(queueMutexes[vi_chn]);
   frameQueues[vi_chn].push(frame_info);
+  frame_id_++;
 
   return image ? 0 : -1;
 }

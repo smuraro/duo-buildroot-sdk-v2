@@ -1,3 +1,4 @@
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <cerrno>
@@ -8,6 +9,9 @@
 #include "app/app_task.hpp"
 #include "framework/utils/tdl_log.hpp"
 #include "opencv2/opencv.hpp"
+
+static volatile sig_atomic_t g_stop = 0;
+static void on_signal(int /*sig*/) { g_stop = 1; }
 bool make_dir(const char *path, mode_t mode = 0755) {
   if (mkdir(path, mode) == 0) {
     return true;  // 创建成功
@@ -96,6 +100,9 @@ int main(int argc, char **argv) {
   const std::string config_file = argv[1];
   const std::string output_folder_path = argv[2];
 
+  signal(SIGINT,  on_signal);
+  signal(SIGTERM, on_signal);
+
   std::shared_ptr<AppTask> app_task =
       AppFactory::createAppTask("fall_detection", config_file);
 
@@ -115,21 +122,30 @@ int main(int argc, char **argv) {
     channel_counter[channel_name] = 0;
   }
 
-  while (true) {
+  while (!g_stop) {
     int processing_channel_num = app_task->getProcessingChannelNum();
     if (processing_channel_num == 0) {
       std::cout << "no processing channel, break" << std::endl;
       break;
     }
     for (const auto &channel_name : channel_names) {
+      if (g_stop) break;
       Packet result;
-      std::cout << "to get result from channel:" << channel_name << std::endl;
       int ret = app_task->getResult(channel_name, result);
+      if (ret == 1) {
+        // Timeout: no frame was available within the poll window.
+        // This is normal for live VI streams — just retry.
+        if (g_stop) break;
+        continue;
+      }
       if (ret != 0) {
+        // Genuine error (pipeline stopped, image null, etc.)
+        if (g_stop) break;
         std::cout << "get result failed" << std::endl;
         app_task->removeChannel(channel_name);
         continue;
       }
+      std::cout << "to get result from channel:" << channel_name << std::endl;
       std::shared_ptr<FallDetectionResult> fd_result =
           result.get<std::shared_ptr<FallDetectionResult>>();
       if (fd_result == nullptr) {
@@ -156,5 +172,7 @@ int main(int argc, char **argv) {
       std::cout << "export fall detection result done" << std::endl;
     }
   }
+
+  std::cout << "shutting down..." << std::endl;
   app_task->release();
 }

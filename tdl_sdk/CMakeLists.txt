@@ -232,7 +232,7 @@ else()
 endif()
 
 # open app modules use the video module for test
-set(APP_VIDEO_ENABLE OFF)
+set(APP_VIDEO_ENABLE ON)
 
 set(REPO_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 

@@ -222,8 +222,13 @@ py::list PyModel::outputParse(
         landmarks.append(landmark);
       }
       box_dict[py::str("landmarks")] = landmarks;
-      if (box.landmarks_score.size() > 0) {
-        box_dict[py::str("landmarks_score")] = box.landmarks_score[0];
+      if (!box.landmarks_score.empty()) {
+        // Export all per-keypoint scores as a list so Python consumers can
+        // filter individual keypoints by confidence (e.g. fall detection).
+        // drawKeypoints already handles both list and scalar formats.
+        py::list lscores;
+        for (float s : box.landmarks_score) lscores.append(s);
+        box_dict[py::str("landmarks_score")] = lscores;
       }
       bboxes.append(box_dict);
     }

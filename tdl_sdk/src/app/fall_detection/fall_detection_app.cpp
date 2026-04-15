@@ -7,6 +7,12 @@
 #include "components/video_decoder/video_decoder_type.hpp"
 #include "utils/tdl_log.hpp"
 
+// Forward declaration of the VI/VPSS teardown helper defined in vi_decoder.cpp.
+// Must be called before ViDecoder's destructor (via pipeline_channels_.clear())
+// frees the VB pool: cvitask_vpss_1 still runs until StopGrp cancels its jobs;
+// freeing the pool while it is active causes a kernel _vb_dqbuf use-after-free.
+extern "C" void vi_decoder_cleanup();
+
 template <typename T>
 T getNodeData(const std::string &node_name, PtrFrameInfo &frame_info) {
   if (frame_info->node_data_.find(node_name) == frame_info->node_data_.end()) {
@@ -92,9 +98,22 @@ int32_t FallDetectionApp::addPipeline(const std::string &pipeline_name,
 }
 
 int32_t FallDetectionApp::release() {
+  // Step 1: stop pipeline threads (joins them).
   for (auto &channel : pipeline_channels_) {
     channel.second->stop();
   }
+
+  // Step 2: stop the VI/VPSS subsystem BEFORE clearing channels.
+  // pipeline_channels_.clear() destroys the ViDecoder, whose destructor calls
+  // deinitialize() → memory_pool_.reset(), freeing the VB pool.  If VPSS is
+  // still running at that point, the kernel cvitask_vpss_1 thread crashes with
+  // a _vb_dqbuf use-after-free.  vi_decoder_cleanup() calls CVI_VPSS_StopGrp
+  // first (cancels all in-flight jobs → cvitask_vpss_1 goes idle), then
+  // detaches the VB pool, making memory_pool_.reset() safe.
+  // No-op when the VI decoder was never initialized (s_isp_alive == false).
+  vi_decoder_cleanup();
+
+  // Step 3: destroy pipeline objects (models, VideoDecoder, VB pool, ...).
   pipeline_channels_.clear();
   return 0;
 }
@@ -124,18 +143,47 @@ std::shared_ptr<PipelineNode> FallDetectionApp::getVideoNode(
     LOGE("video_decoder init failed\n");
     assert(false);
   }
+  if (decoder_type == VideoDecoderType::VI) {
+    int32_t w   = node_config.value("width",  1280);
+    int32_t h   = node_config.value("height",  720);
+    int32_t vb  = node_config.value("vb_buffer_num", 3);
+    ret = video_decoder->initialize(w, h,
+                                    ImageFormat::YUV420SP_VU, vb);
+    if (ret != 0) {
+      LOGE("vi video_decoder initialize failed\n");
+      assert(false);
+    }
+  }
   std::shared_ptr<PipelineNode> video_node =
       std::make_shared<PipelineNode>(Packet::make(video_decoder));
   video_node->setName("video_node");
 
-  auto lambda_func = [](PtrFrameInfo &frame_info, Packet &packet) -> int32_t {
+  // Track whether at least one frame has been read so we know when it is safe
+  // to call release() before acquiring the next frame.  For VI decoder, each
+  // CVI_VPSS_GetChnFrame call consumes one VB buffer; CVI_VPSS_ReleaseChnFrame
+  // (called by VideoDecoder::release()) must be called for every read() or the
+  // VB pool is exhausted and the kernel VPSS driver crashes.
+  auto has_pending_frame = std::make_shared<bool>(false);
+  auto lambda_func = [has_pending_frame](PtrFrameInfo &frame_info,
+                                         Packet &packet) -> int32_t {
     std::shared_ptr<VideoDecoder> video_decoder =
         packet.get<std::shared_ptr<VideoDecoder>>();
+
+    // Release the previous VPSS frame before acquiring the next one.
+    // By the time this lambda is called again the application has already
+    // consumed the result via getResult() and the image is no longer needed
+    // by any inference node.
+    if (*has_pending_frame) {
+      video_decoder->release(0);
+    }
+
     std::shared_ptr<BaseImage> image = nullptr;
     int ret = video_decoder->read(image);
     if (ret != 0) {
       std::cout << "video_decoder read failed" << std::endl;
       // assert(false);
+    } else {
+      *has_pending_frame = true;
     }
     frame_info->node_data_["image"] = Packet::make(image);
     frame_info->frame_id_ = video_decoder->getFrameId();
@@ -290,8 +338,20 @@ int32_t FallDetectionApp::getResult(const std::string &pipeline_name,
                                     Packet &result) {
   std::shared_ptr<FallDetectionResult> fall_detection_result =
       std::make_shared<FallDetectionResult>();
+  // Use a finite timeout so the caller can check a stop-flag and exit cleanly
+  // when Ctrl+C is pressed.  0 means "wait ~10000 s" which prevents clean
+  // shutdown (the pipeline threads are still alive using VPSS when the atexit
+  // handler tries to clean up → kernel deadlock).
+  // 200 ms timeout: gives the pipeline enough time for one inference cycle
+  // (~100 ms for YOLOv8-pose NPU + VPSS on cv181x) while still allowing
+  // Ctrl+C to be noticed within a few hundred ms.
+  // Returns 1 for timeout (no frame yet — caller should retry),
+  //        -1 for genuine error (pipeline stopped or image null).
   PtrFrameInfo frame_info =
-      pipeline_channels_[pipeline_name]->getProcessedFrame(0);
+      pipeline_channels_[pipeline_name]->getProcessedFrame(200);
+  if (!frame_info) {
+    return 1;  // timeout — no frame available yet, caller should retry
+  }
 
   auto image =
       frame_info->node_data_["image"].get<std::shared_ptr<BaseImage>>();
