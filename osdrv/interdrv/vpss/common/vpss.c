@@ -121,7 +121,10 @@ static bool fb_on_vpss;
 static inline CVI_S32 CHECK_VPSS_GRP_CREATED(VPSS_GRP grp)
 {
 	if (!vpssCtx[grp] || !vpssCtx[grp]->isCreated) {
-		CVI_TRACE_VPSS(CVI_DBG_ERR, "Grp(%d) isn't created yet.\n", grp);
+		/* Não é erro: esse helper é usado como probe ("o grupo existe?").
+		 * Nível DEBUG pra evitar spam no log de boot, onde o SDK percorre
+		 * todos os 16 slots. Habilitar via debug level se precisar. */
+		CVI_TRACE_VPSS(CVI_DBG_DEBUG, "Grp(%d) isn't created yet.\n", grp);
 		return CVI_ERR_VPSS_UNEXIST;
 	}
 	return CVI_SUCCESS;
@@ -306,7 +309,7 @@ CVI_VOID vpss_print_vb_info(CVI_U8 grp_id, CVI_U8 sc_idx)
 	chn_id = sc_index_to_chn_id(sc_idx);
 
 	if (vpssCtx[grp_id] == NULL) {
-		CVI_TRACE_VPSS(CVI_DBG_ERR, "Grp(%d) isn't created yet.\n", grp_id);
+		CVI_TRACE_VPSS(CVI_DBG_DEBUG, "Grp(%d) isn't created yet.\n", grp_id);
 		return;
 	}
 	pool_id = vpssCtx[grp_id]->stChnCfgs[chn_id].VbPool;
@@ -357,7 +360,7 @@ CVI_S32 get_dev_info_by_chn(MMF_CHN_S chn, enum CHN_TYPE_E chn_type)
 	if (chn.enModId != CVI_ID_VPSS)
 		return 0;
 	if (vpssCtx[chn.s32DevId] == NULL) {
-		CVI_TRACE_VPSS(CVI_DBG_ERR, "Grp(%d) isn't created yet.\n", chn.s32DevId);
+		CVI_TRACE_VPSS(CVI_DBG_DEBUG, "Grp(%d) isn't created yet.\n", chn.s32DevId);
 		return 0;
 	}
 	/* single mode: img_dev[1], img_in_v + (sc_d -> sc_v1 -> sc_v2 -> sc_v3)  */
