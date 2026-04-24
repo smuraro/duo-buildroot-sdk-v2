@@ -26,7 +26,7 @@ void RTSP::onRTSPConnect(const char *ip, void *arg) {
 }
 
 void RTSP::onRTSPDisconnect(const char *ip, void *arg) {
-  LOGI("RTSP client connected from: %s\n", ip);
+  LOGI("RTSP client disconnected from: %s\n", ip);
 }
 
 int32_t RTSP::initVENC() {
@@ -59,7 +59,7 @@ int32_t RTSP::initVENC() {
     venc_chn_attr.stRcAttr.stH264Cbr.fr32DstFrameRate = context_.frame_rate;
     venc_chn_attr.stRcAttr.stH264Cbr.u32SrcFrameRate = context_.frame_rate;
     venc_chn_attr.stRcAttr.stH264Cbr.u32BitRate = context_.bitrate;
-    venc_chn_attr.stRcAttr.stH264Cbr.bVariFpsEn = CVI_FALSE;
+    venc_chn_attr.stRcAttr.stH264Cbr.bVariFpsEn = CVI_TRUE;
   } else if (venc_chn_attr.stVencAttr.enType == PT_H265) {
     venc_chn_attr.stVencAttr.stAttrH265e.bRcnRefShareBuf = CVI_FALSE;
     venc_chn_attr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
@@ -68,7 +68,7 @@ int32_t RTSP::initVENC() {
     venc_chn_attr.stRcAttr.stH265Cbr.u32SrcFrameRate = context_.frame_rate;
     venc_chn_attr.stRcAttr.stH265Cbr.fr32DstFrameRate = context_.frame_rate;
     venc_chn_attr.stRcAttr.stH265Cbr.u32BitRate = context_.bitrate;
-    venc_chn_attr.stRcAttr.stH265Cbr.bVariFpsEn = CVI_FALSE;
+    venc_chn_attr.stRcAttr.stH265Cbr.bVariFpsEn = CVI_TRUE;
   } else {
     return -1;
   }
@@ -219,50 +219,43 @@ RTSP::~RTSP() {
 
 int32_t RTSP::sendFrame(VIDEO_FRAME_INFO_S *frame) {
   int32_t ret = 0;
-  VENC_STREAM_S stream;
-  VENC_CHN_STATUS_S venc_chn_status;
   VENC_CHN chn = context_.chn;
-  VENC_PACK_S *venc_pack_ptr;
   CVI_RTSP_DATA rtsp_data = {0};
 
   ret = CVI_VENC_SendFrame(chn, frame, FRAME_MILLISEC);
   if (ret != 0) {
-    LOGE("Failed to send frame");
+    LOGE("CVI_VENC_SendFrame failed ret=0x%x", ret);
     return ret;
   }
 
-  ret = CVI_VENC_QueryStatus(chn, &venc_chn_status);
-  if (ret != 0) {
-    LOGE("Failed to query VENC status");
-    return ret;
+  static constexpr uint32_t kMaxStreamPacks = 8;
+  VENC_STREAM_S stream;
+  memset(&stream, 0, sizeof(VENC_STREAM_S));
+  stream.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S) * kMaxStreamPacks);
+  if (!stream.pstPack) {
+    return -1;
   }
+  memset(stream.pstPack, 0, sizeof(VENC_PACK_S) * kMaxStreamPacks);
+  stream.u32PackCount = kMaxStreamPacks;
 
-  stream.pstPack =
-      (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S) * venc_chn_status.u32CurPacks);
   ret = CVI_VENC_GetStream(chn, &stream, FRAME_MILLISEC);
   if (ret != 0) {
-    LOGE("Failed to get VENC stream (ret=0x%x) — flushing buffer", ret);
+    LOGE("CVI_VENC_GetStream failed ret=0x%x", ret);
     free(stream.pstPack);
-    // Flush any stale encoded data so the buffer does not stay full and block
-    // subsequent SendFrame calls.
-    VENC_CHN_STATUS_S st;
-    if (CVI_VENC_QueryStatus(chn, &st) == 0 && st.u32CurPacks > 0) {
-      VENC_PACK_S *flush_pack =
-          (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S) * st.u32CurPacks);
-      VENC_STREAM_S flush_stream;
-      flush_stream.pstPack = flush_pack;
-      if (CVI_VENC_GetStream(chn, &flush_stream, 0) == 0)
-        CVI_VENC_ReleaseStream(chn, &flush_stream);
-      free(flush_pack);
-    }
     return ret;
+  }
+
+  if (stream.u32PackCount == 0) {
+    CVI_VENC_ReleaseStream(chn, &stream);
+    free(stream.pstPack);
+    return -1;
   }
 
   rtsp_data.blockCnt = stream.u32PackCount;
   for (unsigned int i = 0; i < stream.u32PackCount; i++) {
-    venc_pack_ptr = &stream.pstPack[i];
-    rtsp_data.dataPtr[i] = venc_pack_ptr->pu8Addr + venc_pack_ptr->u32Offset;
-    rtsp_data.dataLen[i] = venc_pack_ptr->u32Len - venc_pack_ptr->u32Offset;
+    VENC_PACK_S *pack = &stream.pstPack[i];
+    rtsp_data.dataPtr[i] = pack->pu8Addr + pack->u32Offset;
+    rtsp_data.dataLen[i] = pack->u32Len - pack->u32Offset;
   }
 
   ret = CVI_RTSP_WriteFrame(context_.pstRtspContext, context_.pstSession->video,

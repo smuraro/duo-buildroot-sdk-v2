@@ -2,30 +2,34 @@
 """
 sample_app_fall_detection.py — Detecção de quedas + servidor RTSP
 
-Suporta dois modos de entrada:
-  câmera VI  (padrão)   — sensor ligado diretamente ao SoC
-  RTSP/VDEC (--input)   — stream RTSP decodificado por hardware (VDEC)
+Suporta três modos de entrada:
+  câmera VI  (padrão)    — sensor ligado diretamente ao SoC
+  RTSP/VDEC (--input)    — stream RTSP decodificado por hardware (VDEC)
+  USB/V4L2  (--input)    — câmera USB via V4L2 (UVC, /dev/videoN)
 
 Executa detecção de pose (KEYPOINT_YOLOV8POSE_PERSON17), rastreamento
 multi-pessoa e o algoritmo de detecção de quedas da versão C++
 (fall_detection.cpp). Transmite o resultado anotado via RTSP e grava
 resultados em disco.
 
-Uso (câmera VI):
+Uso (câmera VI — model type auto-detectado):
     python3 sample_app_fall_detection.py \\
-        --model /root/cv181x/keypoint_yolov8pose_person17_...cvimodel \\
-        [--output /tmp/fall_output] \\
-        [--width 1280] [--height 720] [--fps 25] \\
-        [--threshold 0.5] \\
-        [--codec h264] [--bitrate 3072] [--gop 15] [--session live]
+        --model /root/cv181x/keypoint_yolov8pose_person17_...cvimodel
 
-Uso (entrada RTSP via VDEC):
+Uso (câmera VI — parâmetros explícitos):
     python3 sample_app_fall_detection.py \\
         --model /root/cv181x/keypoint_yolov8pose_person17_...cvimodel \\
-        --input rtsp://192.168.1.10:554/live \\
-        [--transport tcp|udp] \\
-        [--width 1280] [--height 720] [--fps 25] \\
-        [--output /tmp/fall_output]
+        --model-type KEYPOINT_YOLOV8POSE_PERSON17 \\
+        [--output /tmp/fall_output] \\
+        [--width 1280] [--height 720] [--fps 25]
+
+Uso (entrada RTSP — resolução auto-detectada):
+    python3 sample_app_fall_detection.py \\
+        --model ... --input rtsp://192.168.1.10:554/live
+
+Uso (câmera USB):
+    python3 sample_app_fall_detection.py \\
+        --model ... --input usb
 
 Conectar ao stream de saída:
     vlc rtsp://<ip>:554/<session>
@@ -43,6 +47,65 @@ from collections import deque
 
 import tdl
 from tdl import image, nn
+
+
+# ─── Auto-detecção de modelo e resolução ─────────────────────────────────────
+
+def _detect_model_type(model_path):
+    """Infere o ModelType a partir do nome do arquivo .cvimodel."""
+    import os
+    basename = os.path.basename(model_path).lower().replace("_", "")
+    _auto_map = [
+        ("keypointyolov8poseperson17", "KEYPOINT_YOLOV8POSE_PERSON17"),
+        ("scrfddetface",        "SCRFD_DET_FACE"),
+        ("yolov8detcoco80",     "YOLOV8_DET_COCO80"),
+        ("yolov8ndetcoco80",    "YOLOV8_DET_COCO80"),
+        ("yolov11ndetcoco80",   "YOLOV11N_DET_COCO80"),
+        ("yolo11ndetcoco80",    "YOLOV11N_DET_COCO80"),
+        ("yolo11detcoco80",     "YOLOV11N_DET_COCO80"),
+        ("yolo26detcoco80",     "YOLOV26_DET_COCO80"),
+        ("yoloxdetcoco80",      "YOLOX_DET_COCO80"),
+        ("yolov10detcoco80",    "YOLOV10_DET_COCO80"),
+        ("yolov7detcoco80",     "YOLOV7_DET_COCO80"),
+        ("yolov6detcoco80",     "YOLOV6_DET_COCO80"),
+        ("yolov5detcoco80",     "YOLOV5_DET_COCO80"),
+    ]
+    for pattern, enum_name in _auto_map:
+        if pattern in basename:
+            return enum_name
+    return None
+
+
+def _probe_rtsp_resolution(url, transport="tcp"):
+    """Conecta brevemente ao stream RTSP via OpenCV para descobrir a resolução.
+
+    Retorna (width, height) ou (0, 0) se não conseguir.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return 0, 0
+    try:
+        import os
+        env_key = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
+        old = os.environ.get(env_key, "")
+        os.environ[env_key] = f"rtsp_transport;{transport}"
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        if old:
+            os.environ[env_key] = old
+        else:
+            os.environ.pop(env_key, None)
+
+        if not cap.isOpened():
+            return 0, 0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return 0, 0
 
 
 # ─── Constantes do algoritmo de detecção de quedas ───────────────────────────
@@ -381,6 +444,8 @@ _release_lock    = threading.Lock()
 _last_results    = []       # lista de dicts com bbox + fall status + landmarks
 _results_lock    = threading.Lock()
 _infer_fps       = 0.0
+_infer_ms_acc    = 0.0      # acumulador para média por janela de reporte
+_infer_count_window = 0     # contagem de inferências na janela actual
 _frame_count     = 0
 _fallen_ids      = set()    # track_ids que tiveram queda desde o último report
 _fallen_lock     = threading.Lock()
@@ -388,7 +453,7 @@ _fallen_lock     = threading.Lock()
 _VB_BUFFER_NUM   = 5
 _vb_sem          = threading.Semaphore(_VB_BUFFER_NUM - 2)
 _MAX_RELEASE_PENDING = 2
-_use_vb_sem      = True   # False quando a entrada é RtspClientVdec
+_source_type     = "vi"   # "vi" | "vdec" | "usb"
 
 
 # ─── Thread de inferência / rastreamento / detecção de quedas ────────────────
@@ -405,10 +470,11 @@ def _inference_worker(detector, cam, tracker, fps: float, output_file: str):
       5. Grava resultado em disco (se output_dir fornecido).
 
     Para todos os frames (do_infer ou não):
-      - Chama cam.release() em ordem FIFO.
-      - Libera o semáforo de VB.
+      - Chama cam.release() em ordem FIFO (vi) ou release_inference() (vdec).
+      - Libera o semáforo de VB apenas para fonte "vi".
     """
-    global _running, _infer_fps, _last_results, _use_vb_sem, _fallen_ids
+    global _running, _infer_fps, _last_results, _source_type, _fallen_ids
+    global _infer_ms_acc, _infer_count_window
 
     muti_person: dict = {}    # {track_id: FallDet}
     # Contador sequencial para o tracker — NÃO usa frame_id da câmera.
@@ -422,22 +488,27 @@ def _inference_worker(detector, cam, tracker, fps: float, output_file: str):
     count = 0
     t0 = time.time()
 
-    while _running:
+    while True:
         item = None
         with _release_lock:
             if _release_queue:
                 item = _release_queue.pop(0)
 
         if item is None:
+            if not _running:
+                break          # fila vazia e sinal de parada: encerra
             time.sleep(0.001)
             continue
 
         frame, frame_id, do_infer = item
 
         if do_infer:
-            ti = time.time()
             # ── 1. Detecção de pose ─────────────────────────────────────────
             dets = detector.inference(frame)
+            # Use C++ steady_clock measurement (excludes GIL wait time).
+            dt = detector.get_last_inference_ms()
+            _infer_ms_acc += dt
+            _infer_count_window += 1
 
             # ── 2. Rastreamento ─────────────────────────────────────────────
             # O modelo YoloV8Pose não chama setTypeMapping(), portanto
@@ -547,21 +618,23 @@ def _inference_worker(detector, cam, tracker, fps: float, output_file: str):
                 _write_result(output_file, frame_id, results,
                               frame.get_size()[0], frame.get_size()[1])
 
-            elapsed = time.time() - ti
-            count  += 1
-            total   = time.time() - t0
+            count += 1
+            total  = time.time() - t0
             if total > 0:
                 _infer_fps = count / total
 
         # Libera sempre em ordem FIFO.
-        # VI camera: cam.release() devolve buffer ao VB pool + libera semáforo.
-        # RtspClientVdec: release_inference() libera o slot de inferência
-        #   (o slot de display já foi liberado pelo loop principal após pin_for_inference).
-        if _use_vb_sem:
+        # vi:   cam.release() devolve buffer ao VB pool + libera semáforo.
+        # vdec: release_inference() libera o slot de inferência
+        #         (slot de display já liberado pelo loop após pin_for_inference).
+        # usb:  cam.release() é no-op; VPSSImage gerencia própria memória ION.
+        if _source_type == "vi":
             cam.release()
             _vb_sem.release()
-        else:
+        elif _source_type == "vdec":
             cam.release_inference()
+        else:
+            cam.release()
 
 
 def _write_result(output_file: str, frame_id: int, results: list,
@@ -715,12 +788,13 @@ def parse_args():
         description="Detecção de quedas com câmera VI ou entrada RTSP + servidor RTSP")
     p.add_argument("--model", required=True,
                    help="Caminho para o .cvimodel de pose (KEYPOINT_YOLOV8POSE_PERSON17)")
-    p.add_argument("--model-type", default="KEYPOINT_YOLOV8POSE_PERSON17",
-                   dest="model_type",
-                   help="ModelType do modelo de pose (padrão: KEYPOINT_YOLOV8POSE_PERSON17)")
+    p.add_argument("--model-type", default="", dest="model_type",
+                   help="ModelType do modelo de pose (ex: KEYPOINT_YOLOV8POSE_PERSON17). "
+                        "Auto-detectado pelo nome do arquivo se omitido.")
     p.add_argument("--input", default="",
-                   help="URL do stream RTSP de entrada (ex: rtsp://192.168.1.10:554/live). "
-                        "Se omitido, usa a câmera VI local.")
+                   help="Fonte de vídeo: vazio = câmera VI local; "
+                        "rtsp://... = stream RTSP (VDEC hardware); "
+                        "usb = câmera USB /dev/video0; usb:1 = /dev/video1.")
     p.add_argument("--transport", default="tcp", choices=["tcp", "udp"],
                    help="Protocolo de transporte RTSP de entrada (padrão: tcp)")
     p.add_argument("--output", default="",
@@ -728,8 +802,12 @@ def parse_args():
                         "Cada linha corresponde a uma queda; o arquivo é criado/sobrescrito "
                         "ao iniciar e os eventos são acrescentados durante a execução. "
                         "Se omitido, apenas transmite via RTSP.")
-    p.add_argument("--width",   type=int, default=1280)
-    p.add_argument("--height",  type=int, default=720)
+    p.add_argument("--width",   type=int, default=0,
+                   help="Largura em pixels (auto-detectado se omitido; "
+                        "padrão: 1280 para VI, 640 para USB)")
+    p.add_argument("--height",  type=int, default=0,
+                   help="Altura em pixels (auto-detectado se omitido; "
+                        "padrão: 720 para VI, 480 para USB)")
     p.add_argument("--fps",     type=float, default=25.0,
                    help="FPS da câmera/pipeline (usado no algoritmo de velocidade, padrão: 25)")
     p.add_argument("--threshold", type=float, default=0.5,
@@ -737,20 +815,86 @@ def parse_args():
     p.add_argument("--codec",   default="h264", choices=["h264", "h265"])
     p.add_argument("--bitrate", type=int, default=3072,
                    help="Bitrate RTSP em kbps (padrão: 3072)")
-    p.add_argument("--gop",     type=int, default=15)
+    p.add_argument("--gop",     type=int, default=0,
+                   help="Intervalo de keyframe em frames (padrão: 0 = automático: 1× fps)")
     p.add_argument("--session", default="live",
                    help="Nome da sessão RTSP de saída (padrão: live)")
     p.add_argument("--mirror",  action="store_true", default=False,
                    help="Espelho horizontal (apenas câmera VI)")
     p.add_argument("--flip",    action="store_true", default=False,
                    help="Flip vertical (apenas câmera VI)")
+    p.add_argument("--frames",  type=int, default=0,
+                   help="Número de frames a processar; 0 = infinito (padrão)")
     return p.parse_args()
+
+
+# ─── Abertura da fonte de vídeo ───────────────────────────────────────────────
+
+def _open_source(args):
+    """Abre a fonte de vídeo conforme --input e retorna (cam, source_type)."""
+    inp = args.input.strip()
+    if inp.lower().startswith("usb"):
+        device = 0
+        if ":" in inp:
+            try:
+                device = int(inp.split(":", 1)[1])
+            except ValueError:
+                pass
+        if not hasattr(image, "UsbCamera"):
+            print("[ERRO] UsbCamera não disponível nesta build (requer OpenCV videoio).")
+            sys.exit(1)
+        req_w = args.width if args.width else 640
+        req_h = args.height if args.height else 480
+        print(f"\nAbrindo câmera USB /dev/video{device}  {req_w}x{req_h} ...")
+        cam = image.UsbCamera(device, req_w, req_h)
+        if not cam.is_opened():
+            print(f"[ERRO] Não foi possível abrir /dev/video{device}.")
+            sys.exit(1)
+        if hasattr(cam, 'width') and hasattr(cam, 'height'):
+            args.width, args.height = cam.width, cam.height
+        else:
+            args.width, args.height = req_w, req_h
+        print(f"  Backend: USB V4L2 /dev/video{device}  {args.width}x{args.height}")
+        return cam, "usb"
+    elif inp.startswith("rtsp://") or inp.startswith("rtsps://"):
+        w, h = args.width, args.height
+        if w == 0 or h == 0:
+            print(f"\nAuto-detectando resolução de {inp} ...")
+            w, h = _probe_rtsp_resolution(inp, args.transport)
+            if w > 0 and h > 0:
+                print(f"  Resolução detectada: {w}x{h}")
+                args.width, args.height = w, h
+            else:
+                print("[ERRO] Não foi possível detectar resolução do stream RTSP.\n"
+                      "  Especifique manualmente com --width e --height.")
+                sys.exit(1)
+        print(f"\nAbrindo stream RTSP {inp} ({args.transport}) ...")
+        cam = image.RtspClientVdec(inp, width=w, height=h,
+                                   transport=args.transport)
+        if not cam.is_opened():
+            print("[ERRO] Não foi possível abrir o stream RTSP.")
+            sys.exit(1)
+        print(f"  Backend: VDEC hardware (H264)  {w}x{h}")
+        return cam, "vdec"
+    else:
+        if args.width == 0:
+            args.width = 1280
+        if args.height == 0:
+            args.height = 720
+        print(f"\nAbrindo câmera VI {args.width}x{args.height} ...")
+        cam = image.Camera(args.width, args.height,
+                           image.ImageFormat.YUV420SP_VU,
+                           vb_buffer_num=_VB_BUFFER_NUM,
+                           mirror=args.mirror, flip=args.flip)
+        print("  Backend: câmera VI local")
+        return cam, "vi"
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    global _running, _frame_count, _use_vb_sem
+    global _running, _frame_count, _source_type
+    global _infer_ms_acc, _infer_count_window
 
     args = parse_args()
 
@@ -763,12 +907,27 @@ def main():
             sys.exit(1)
         print(f"Quedas registradas em: {args.output}")
 
+    # --- Model type (auto-detect se não especificado) ---
+    model_type_name = args.model_type
+    if not model_type_name:
+        model_type_name = _detect_model_type(args.model)
+        if not model_type_name:
+            print("[ERRO] Não foi possível inferir --model-type pelo nome do arquivo.\n"
+                  "  Especifique manualmente com --model-type.")
+            print("  Tipos disponíveis: " + ", ".join(
+                t for t in dir(nn.ModelType) if not t.startswith("_")))
+            sys.exit(1)
+        print(f"ModelType auto     : {model_type_name}")
+
     # --- Modelo de pose ---
-    model_type = getattr(nn.ModelType, args.model_type, None)
+    model_type = getattr(nn.ModelType, model_type_name, None)
     if model_type is None:
-        print(f"[ERRO] ModelType desconhecido: {args.model_type}")
+        print(f"[ERRO] ModelType desconhecido: {model_type_name}")
+        print("  Tipos disponíveis: " + ", ".join(
+            t for t in dir(nn.ModelType) if not t.startswith("_")))
         sys.exit(1)
     print(f"Carregando modelo  : {args.model}")
+    print(f"ModelType          : {model_type_name}")
     detector = nn.get_model(model_type, args.model)
     detector.set_threshold(args.threshold)
     print(f"Limiar             : {detector.get_threshold():.2f}")
@@ -776,42 +935,40 @@ def main():
     # --- Tracker SORT ---
     tracker = nn.Tracker(nn.TrackerType.MOT_SORT)
 
+    # --- Fonte de vídeo ---
+    cam, _source_type = _open_source(args)
+
+    # --- Auto-ajuste fps/gop para câmera USB ---
+    rtsp_fps = int(args.fps)
+    rtsp_bitrate = args.bitrate
+    if _source_type == "usb" and rtsp_fps > 10:
+        rtsp_fps = 3
+        print(f"  [auto] FPS ajustado para {rtsp_fps} (câmera USB geralmente entrega ≤5fps)")
+    if _source_type == "usb" and rtsp_bitrate >= 2048:
+        rtsp_bitrate = 1024
+        print(f"  [auto] Bitrate ajustado para {rtsp_bitrate}kbps (USB: NALUs menores → "
+              f"compatível com VLC/UDP)")
+    rtsp_gop = args.gop if args.gop > 0 else max(1, rtsp_fps)
+    if _source_type == "usb" and args.gop <= 0:
+        rtsp_gop = max(1, rtsp_fps)
+        print(f"  [auto] GOP ajustado para {rtsp_gop} (1 keyframe/s para câmera USB)")
+
     # --- Servidor RTSP de saída ---
-    # IMPORTANTE: RTSPServer deve ser criado ANTES do RtspClientVdec
-    # (requisito de ordenação do Wave4/VDEC).
     print(f"\nIniciando RTSP {args.width}x{args.height} "
-          f"codec={args.codec} bitrate={args.bitrate}kbps "
+          f"codec={args.codec} bitrate={rtsp_bitrate}kbps "
+          f"fps={rtsp_fps} gop={rtsp_gop} ({rtsp_gop/rtsp_fps:.1f}s) "
           f"sessão={args.session} ...")
     rtsp = image.RTSPServer(
         args.width, args.height,
         chn=0,
         codec=args.codec,
         session_name=args.session,
-        bitrate=args.bitrate,
-        gop=args.gop,
+        bitrate=rtsp_bitrate,
+        gop=rtsp_gop,
+        fps=rtsp_fps,
     )
     print(f"  Stream: rtsp://<ip>:554/{args.session}")
-
-    # --- Fonte de vídeo: câmera VI ou cliente RTSP/VDEC ---
-    if args.input:
-        # Entrada RTSP via VDEC hardware — sem VB pool próprio, sem semáforo.
-        _use_vb_sem = False
-        print(f"\nAbrindo stream RTSP {args.input} ({args.transport}) ...")
-        cam = image.RtspClientVdec(args.input,
-                                   width=args.width, height=args.height,
-                                   transport=args.transport)
-        if not cam.is_opened():
-            print("[ERRO] Não foi possível abrir o stream RTSP.")
-            sys.exit(1)
-        print("  Backend: VDEC hardware (H264)")
-    else:
-        # Câmera VI local — usa VB pool e semáforo.
-        _use_vb_sem = True
-        print(f"\nAbrindo câmera {args.width}x{args.height} ...")
-        cam = image.Camera(args.width, args.height,
-                           image.ImageFormat.YUV420SP_VU,
-                           vb_buffer_num=_VB_BUFFER_NUM,
-                           mirror=args.mirror, flip=args.flip)
+    print(f"  VLC: vlc --rtsp-tcp rtsp://<ip>:554/{args.session}")
 
     # --- Thread de inferência ---
     infer_thread = threading.Thread(
@@ -823,14 +980,15 @@ def main():
 
     # --- Loop principal ---
     frame_idx  = 0
+    _frame_limit = args.frames if args.frames > 0 else None
     t_start    = time.time()
     t_report   = t_start
 
     print("\nDetectando quedas... (Ctrl+C para parar)\n")
 
     try:
-        while _running:
-            if _use_vb_sem and not _vb_sem.acquire(timeout=0.5):
+        while _running and (_frame_limit is None or frame_idx < _frame_limit):
+            if _source_type == "vi" and not _vb_sem.acquire(timeout=0.5):
                 continue
 
             frame = cam.read()
@@ -845,16 +1003,20 @@ def main():
             # Para RtspClientVdec: move o frame para o slot de inferência e
             # libera o slot de display imediatamente, permitindo o próximo read().
             # A thread de inferência usa o frame e chama release_inference().
-            if not _use_vb_sem:
+            if _source_type == "vdec":
                 cam.pin_for_inference()
 
             do_infer = True
             with _release_lock:
                 if len(_release_queue) >= _MAX_RELEASE_PENDING:
                     do_infer = False
-                _release_queue.append((frame, frame_idx, do_infer))
+                # USB: cam.release() é no-op, então frames sem inferência
+                # não precisam da fila — VB blocks liberados pelo GC quando
+                # a referência local 'frame' é sobrescrita no próximo read().
+                if do_infer or _source_type != "usb":
+                    _release_queue.append((frame, frame_idx, do_infer))
 
-            if not _use_vb_sem:
+            if _source_type == "vdec":
                 cam.release()  # libera slot de display; slot de inferência ainda vivo
             frame_idx    += 1
             _frame_count  = frame_idx
@@ -864,13 +1026,18 @@ def main():
             if now - t_report >= 5.0:
                 elapsed = now - t_start
                 cam_fps = frame_idx / elapsed if elapsed > 0 else 0
+                ni = max(_infer_count_window, 1)
+                avg_infer = _infer_ms_acc / ni
                 with _fallen_lock:
                     n_fall = len(_fallen_ids)
                     _fallen_ids.clear()
                 print(f"  frame {frame_idx:6d}  "
                       f"cam={cam_fps:5.1f}fps  "
                       f"inf={_infer_fps:4.1f}fps  "
+                      f"inf={avg_infer:5.1f}ms  "
                       f"pessoas={len(results)}  quedas={n_fall}")
+                _infer_ms_acc = 0.0
+                _infer_count_window = 0
                 t_report = now
 
     except Exception as exc:
@@ -878,7 +1045,7 @@ def main():
         import traceback; traceback.print_exc()
     finally:
         _running = False
-        if _use_vb_sem:
+        if _source_type == "vi":
             _vb_sem.release()
         infer_thread.join(timeout=3.0)
         with _release_lock:

@@ -1,5 +1,6 @@
 #include "keypoints_detection/lstr_lane.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <sstream>
@@ -40,8 +41,13 @@ int32_t LstrLane::outputParse(
        input_tensor.shape[0], input_tensor.shape[1], input_tensor.shape[2],
        input_tensor.shape[3]);
 
-  std::string out_conf_name = net_->getOutputNames()[0];
-  std::string out_feature_name = net_->getOutputNames()[1];
+  const auto &output_names = net_->getOutputNames();
+  if (output_names.size() < 2) {
+    LOGE("LstrLane expects 2 output tensors, got %zu", output_names.size());
+    return -1;
+  }
+  std::string out_conf_name    = output_names[0];
+  std::string out_feature_name = output_names[1];
 
   TensorInfo out_feature_info = net_->getTensorInfo(out_feature_name);
   std::shared_ptr<BaseTensor> out_feature_tensor =
@@ -120,18 +126,42 @@ int32_t LstrLane::outputParse(
       float true_y2 = lower + NUM_SLICES * (1 - CUT_SLICES_RATIO) * slice;
       float true_x2 = gen_x_by_y(true_y2, point_map[final_index[i]]);
 
-      lane_landmark.landmarks_y.push_back(DETECTION_UPPER_LIMIT *
-                                          obj->image_height);
-      lane_landmark.landmarks_x.push_back(
+      // Skip lanes where the line equation blew up (divide-by-zero in
+      // gen_x_by_y when ys == point_line[3]) — produces NaN/inf that would
+      // propagate as garbage coordinates downstream.
+      if (!std::isfinite(true_x1) || !std::isfinite(true_x2) ||
+          (true_y2 - true_y1) == 0.0f) {
+        continue;
+      }
+
+      float py_upper = DETECTION_UPPER_LIMIT * obj->image_height;
+      float px_upper =
           (true_x1 + (DETECTION_UPPER_LIMIT - true_y1) * (true_x2 - true_x1) /
                          (true_y2 - true_y1)) *
-          obj->image_width);
-      lane_landmark.landmarks_y.push_back(DETECTION_LOWER_LIMIT *
-                                          obj->image_height);
-      lane_landmark.landmarks_x.push_back(
+          obj->image_width;
+      float py_lower = DETECTION_LOWER_LIMIT * obj->image_height;
+      float px_lower =
           (true_x1 + (DETECTION_LOWER_LIMIT - true_y1) * (true_x2 - true_x1) /
                          (true_y2 - true_y1)) *
-          obj->image_width);
+          obj->image_width;
+
+      if (!std::isfinite(px_upper) || !std::isfinite(px_lower)) {
+        continue;
+      }
+
+      lane_landmark.landmarks_y.push_back(py_upper);
+      lane_landmark.landmarks_x.push_back(px_upper);
+      lane_landmark.landmarks_y.push_back(py_lower);
+      lane_landmark.landmarks_x.push_back(px_lower);
+
+      // Populate scalar metadata fields so consumers that read class_id /
+      // score / xN / yN don't see uninitialized memory.
+      lane_landmark.class_id = (int32_t)i;   // lane index serves as id
+      lane_landmark.score    = 1.0f;         // LSTR already filters its output
+      lane_landmark.x1 = std::min(px_upper, px_lower);
+      lane_landmark.x2 = std::max(px_upper, px_lower);
+      lane_landmark.y1 = py_upper;
+      lane_landmark.y2 = py_lower;
 
       obj->box_landmarks.push_back(lane_landmark);
     }

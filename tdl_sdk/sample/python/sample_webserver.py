@@ -5,16 +5,23 @@ sample_webserver.py — Câmera + inferência TDL + servidor web
 Abre a câmera, carrega um modelo TDL, desenha as detecções em cada frame
 e serve um preview JPEG anotado numa interface web na porta 9000.
 
-Uso:
+Suporta três fontes de vídeo (--input):
+  vazio         câmera VI local (padrão)
+  rtsp://...    stream RTSP decodificado por hardware (VDEC)
+  usb / usb:N   câmera USB /dev/video0 (ou /dev/videoN)
+
+Uso (câmera VI):
     python3 sample_webserver.py \\
         --model /root/cv181x/scrfd_det_face_432_768_INT8_cv181x.cvimodel \\
-        [--model-type SCRFD_DET_FACE] \\
-        [--width 1280] [--height 720] \\
-        [--threshold 0.5] \\
-        [--jpeg-quality 75] \\
-        [--preview-scale 0.5] \\
-        [--web-fps 5] \\
-        [--web-port 9000]
+        [--model-type SCRFD_DET_FACE] [--width 1280] [--height 720]
+
+Uso (entrada RTSP via VDEC):
+    python3 sample_webserver.py \\
+        --model ... --input rtsp://192.168.1.10:554/live [--transport tcp|udp]
+
+Uso (câmera USB):
+    python3 sample_webserver.py \\
+        --model ... --input usb [--width 640] [--height 480]
 
 Acesso:
     http://<ip-do-dispositivo>:9000/
@@ -206,11 +213,38 @@ def inference_loop(args):
     detector.set_threshold(args.threshold)
     print(f"Limiar             : {detector.get_threshold():.2f}")
 
-    # Open camera
-    _set_state(status="Abrindo câmera...")
-    print(f"\nAbrindo câmera {args.width}x{args.height} ...")
-    cam = image.Camera(args.width, args.height, image.ImageFormat.YUV420SP_VU,
-                       mirror=args.mirror, flip=args.flip)
+    # Open camera / video source
+    _set_state(status="Abrindo fonte de video...")
+    inp = args.input.strip()
+    if inp.lower().startswith("usb"):
+        device = 0
+        if ":" in inp:
+            try:
+                device = int(inp.split(":", 1)[1])
+            except ValueError:
+                pass
+        if not hasattr(image, "UsbCamera"):
+            print("[ERRO] UsbCamera não disponível nesta build (requer OpenCV videoio).")
+            sys.exit(1)
+        print(f"\nAbrindo câmera USB /dev/video{device}  {args.width}x{args.height} ...")
+        cam = image.UsbCamera(device, args.width, args.height)
+        if not cam.is_opened():
+            print(f"[ERRO] Não foi possível abrir /dev/video{device}.")
+            sys.exit(1)
+        print(f"  Backend: USB V4L2 /dev/video{device}")
+    elif inp.startswith("rtsp://") or inp.startswith("rtsps://"):
+        print(f"\nAbrindo stream RTSP {inp} ({args.transport}) ...")
+        cam = image.RtspClientVdec(inp, width=args.width, height=args.height,
+                                   transport=args.transport)
+        if not cam.is_opened():
+            print("[ERRO] Não foi possível abrir o stream RTSP.")
+            sys.exit(1)
+        print("  Backend: VDEC hardware (H264)")
+    else:
+        print(f"\nAbrindo câmera VI {args.width}x{args.height} ...")
+        cam = image.Camera(args.width, args.height, image.ImageFormat.YUV420SP_VU,
+                           mirror=args.mirror, flip=args.flip)
+        print("  Backend: câmera VI local")
 
     _set_state(status="Running")
     print("Iniciando loop de inferência...\n")
@@ -224,13 +258,14 @@ def inference_loop(args):
     jpeg_interval = 1.0 / max(1, args.web_fps)
     last_jpeg_time = 0.0
 
-    t_start   = time.time()
-    t_report  = t_start
-    frame_idx = 0
-    jpeg_ms   = 0
+    t_start      = time.time()
+    t_report     = t_start
+    frame_idx    = 0
+    jpeg_ms      = 0
+    _frame_limit = args.frames if args.frames > 0 else None
 
     try:
-        while _running:
+        while _running and (_frame_limit is None or frame_idx < _frame_limit):
             frame = cam.read()
 
             # Inference
@@ -285,6 +320,8 @@ def inference_loop(args):
         _set_state(status=f"Erro: {exc}")
         print(f"\n[ERRO] {exc}")
     finally:
+        _running = False
+        _set_state(status="Parado")
         detector.close()
         cam.close()
 
@@ -797,14 +834,22 @@ def parse_args():
                         "(padrão: 5). Inferência roda mais rápido entre os encodes.")
     p.add_argument("--web-port",       type=int,   default=9000, dest="web_port",
                    help="Porta do servidor web (padrão: 9000)")
+    p.add_argument("--input",     default="",
+                   help="Fonte de vídeo: vazio = câmera VI local; "
+                        "rtsp://... = stream RTSP (VDEC hardware); "
+                        "usb = /dev/video0; usb:1 = /dev/video1.")
+    p.add_argument("--transport", default="tcp", choices=["tcp", "udp"],
+                   help="Transporte RTSP de entrada (padrão: tcp)")
     p.add_argument("--mirror", action="store_true", default=False,
-                   help="Espelhar horizontalmente a imagem da câmera (flip esquerda↔direita).")
+                   help="Espelhar horizontalmente a imagem da câmera. Apenas câmera VI.")
     p.add_argument("--flip",  action="store_true", default=False,
-                   help="Inverter verticalmente a imagem da câmera (flip cima↔baixo).")
+                   help="Inverter verticalmente a imagem da câmera. Apenas câmera VI.")
     p.add_argument("--labels", default="", dest="labels",
                    help="Nomes das classes para modelos genéricos (YOLOV26, YOLOV8…). "
                         "Aceita caminho para arquivo .txt (uma classe por linha) "
                         "ou lista separada por vírgula: 'gato,cachorro,pássaro'.")
+    p.add_argument("--frames",  type=int, default=0,
+                   help="Número de frames a processar; 0 = infinito (padrão)")
     return p.parse_args()
 
 

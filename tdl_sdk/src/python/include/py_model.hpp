@@ -3,6 +3,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <chrono>
 #include "components/tracker/tracker_types.hpp"
 #include "image/base_image.hpp"
 #include "model/base_model.hpp"
@@ -40,8 +41,13 @@ class PyModel {
   std::vector<std::string> getInputNames() const;
   std::vector<std::string> getOutputNames() const;
 
+  // Time of the last inference call (VPSS + NPU + postprocess), measured
+  // inside the GIL-released block so it excludes Python thread scheduling.
+  float getLastInferenceMs() const { return last_inference_ms_; }
+
  protected:
   std::shared_ptr<BaseModel> model_;
+  float last_inference_ms_ = 0.0f;
 
  private:
   py::list outputParse(

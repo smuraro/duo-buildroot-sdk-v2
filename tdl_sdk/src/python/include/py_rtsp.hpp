@@ -105,5 +105,38 @@ void drawInstanceSegmentation(PyImage& image, const py::object& result,
 // result: list containing a string, as returned by OCR models.
 void drawOcr(PyImage& image, const py::object& result);
 
+// Debug: draw a thumbnail of the face crop region in the bottom-right corner.
+// face_x1..face_y2: detected face bbox.  thumb_size: thumbnail px (default 96).
+// pad_ratio: padding around the face (default 0.2 = 20%).
+void drawCropOverlay(PyImage& image, float face_x1, float face_y1,
+                     float face_x2, float face_y2,
+                     int thumb_size = 96, float pad_ratio = 0.2f);
+
+// Two-phase thumbnail API.
+//
+// captureFaceCrop reads the pristine face region from the frame NOW (before
+// any bbox/label drawing contaminates those pixels) and returns an opaque
+// snapshot dict carrying the downsampled Y+UV thumbnail pixels.  The caller
+// then draws bounding boxes, classification labels etc., and finally calls
+// drawFaceThumbnail to paint the bottom-right preview over the top of those
+// drawings — so the preview shows the exact image the stage-2 model received,
+// with zero bbox/label bleed into the thumbnail rectangle and zero bbox-edge
+// contamination inside the thumbnail content.
+//
+// Returns an empty dict (py::dict()) when the crop would be invalid (face
+// bbox empty, thumbnail too small, or off-screen).  drawFaceThumbnail treats
+// an empty dict as a no-op so callers can pass it unconditionally.
+py::dict captureFaceCrop(PyImage& image, float face_x1, float face_y1,
+                         float face_x2, float face_y2,
+                         int thumb_size = 96, float pad_ratio = 0.2f);
+
+void drawFaceThumbnail(PyImage& image, const py::dict& snapshot);
+
+// Return the worst-case bounding rect (x1, y1, x2, y2) of the thumbnail in
+// frame pixel coordinates — including the white border. Use this to filter
+// face detections that fall inside the thumbnail region (those are the
+// detector latching onto the thumbnail painted on the previous frame).
+py::tuple getThumbnailRect(PyImage& image, int thumb_size = 96);
+
 }  // namespace pytdl
 #endif  // PYTHON_RTSP_HPP_

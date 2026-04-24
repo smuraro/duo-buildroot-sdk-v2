@@ -234,7 +234,11 @@ int32_t VpssPreprocessor::prepareVPSSParams(
       params.dst_height     == cached_dst_h_   &&
       static_cast<int>(params.dst_image_format) == cached_dst_fmt_ &&
       static_cast<int>(params.dst_pixdata_type)  == cached_dst_dtype_ &&
-      params.use_nearest_resize == cached_nearest_;
+      params.use_nearest_resize == cached_nearest_ &&
+      params.crop_x      == cached_crop_x_ &&
+      params.crop_y      == cached_crop_y_ &&
+      params.crop_width   == cached_crop_w_ &&
+      params.crop_height  == cached_crop_h_;
 
   if (same) {
     return 0;
@@ -289,6 +293,10 @@ int32_t VpssPreprocessor::prepareVPSSParams(
   cached_dst_fmt_   = static_cast<int>(params.dst_image_format);
   cached_dst_dtype_ = static_cast<int>(params.dst_pixdata_type);
   cached_nearest_   = params.use_nearest_resize;
+  cached_crop_x_    = params.crop_x;
+  cached_crop_y_    = params.crop_y;
+  cached_crop_w_    = params.crop_width;
+  cached_crop_h_    = params.crop_height;
   vpss_params_valid_ = true;
   return 0;
 }

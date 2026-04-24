@@ -11,9 +11,12 @@ py::list PyModel::inference(const PyImage& image) {
   images.push_back(image.getImage());
   std::vector<std::shared_ptr<ModelOutputInfo>> out_datas;
   {
-    py::gil_scoped_release release;   // libera GIL durante VPSS + NPU
+    py::gil_scoped_release release;
+    auto t0 = std::chrono::steady_clock::now();
     model_->inference(images, out_datas);
-  }  // GIL re-adquirido aqui
+    auto t1 = std::chrono::steady_clock::now();
+    last_inference_ms_ = std::chrono::duration<float, std::milli>(t1 - t0).count();
+  }
   return outputParse(out_datas);
 }
 
@@ -32,9 +35,12 @@ py::list PyModel::inference(const PyImage& image, const py::dict& parameters) {
   images.push_back(image.getImage());
   std::vector<std::shared_ptr<ModelOutputInfo>> out_datas;
   {
-    py::gil_scoped_release release;   // libera GIL durante VPSS + NPU
+    py::gil_scoped_release release;
+    auto t0 = std::chrono::steady_clock::now();
     model_->inference(images, out_datas, params);
-  }  // GIL re-adquirido aqui
+    auto t1 = std::chrono::steady_clock::now();
+    last_inference_ms_ = std::chrono::duration<float, std::milli>(t1 - t0).count();
+  }
   return outputParse(out_datas);
 }
 
@@ -70,7 +76,10 @@ py::list PyModel::inferenceWithDetections(const PyImage& pyimg,
   std::vector<std::shared_ptr<ModelOutputInfo>> out_datas;
   {
     py::gil_scoped_release release;
+    auto t0 = std::chrono::steady_clock::now();
     model_->inference(image, model_box_info, out_datas, {});
+    auto t1 = std::chrono::steady_clock::now();
+    last_inference_ms_ = std::chrono::duration<float, std::milli>(t1 - t0).count();
   }
 
   // outputParse scales landmark coordinates by the full-frame dimensions
@@ -79,67 +88,126 @@ py::list PyModel::inferenceWithDetections(const PyImage& pyimg,
   //   stored  = output_point_x * frame_w
   //   correct = output_point_x * crop_w + crop_x1
   //           = (stored / frame_w) * crop_w + crop_x1
+  // Attribute name mapping (same as outputParse — used for CLS_ATTRIBUTE).
+  static const std::map<int, std::string> kAttrName = {
+      {OBJECT_ATTRIBUTE_HUMAN_GENDER,         "gender"},
+      {OBJECT_ATTRIBUTE_HUMAN_AGE,            "age"},
+      {OBJECT_ATTRIBUTE_HUMAN_MASK,           "mask"},
+      {OBJECT_ATTRIBUTE_HUMAN_HAT,            "hat"},
+      {OBJECT_ATTRIBUTE_HUMAN_GLASSES,        "glasses"},
+      {OBJECT_ATTRIBUTE_HUMAN_EMOTION,        "emotion"},
+      {OBJECT_ATTRIBUTE_HUMAN_POSE,           "pose"},
+      {OBJECT_CLS_ATTRIBUTE_FACE_BLURNESS,    "blurness"},
+  };
+
   int n = std::min((int)out_datas.size(), (int)det_list.size());
   py::list result;
   for (int i = 0; i < n; ++i) {
+    // ── Landmarks (KEYPOINT / LANDMARK stage-2) ──────────────────────────
     auto lm = std::dynamic_pointer_cast<ModelLandmarksInfo>(out_datas[i]);
-    if (!lm) continue;
+    if (lm) {
+      const auto& padded = model_box_info->bboxes[i];
+      float pcw = padded.x2 - padded.x1;
+      float pch = padded.y2 - padded.y1;
+      float fw  = (float)lm->image_width;
+      float fh  = (float)lm->image_height;
 
-    // The model ran on the PADDED crop stored in model_box_info->bboxes[i].
-    // outputParse() scales landmark coordinates by the full-frame dimensions
-    // instead of the crop dimensions, so we must remap:
-    //   stored  = output_point_x * frame_w
-    //   correct = output_point_x * crop_w + crop_x1
-    //           = (stored / frame_w) * crop_w + crop_x1
-    // Use the padded bbox for the crop geometry — it must match exactly what
-    // was passed to model_->inference().
-    const auto& padded = model_box_info->bboxes[i];
-    float pcw = padded.x2 - padded.x1;
-    float pch = padded.y2 - padded.y1;
-    float fw  = (float)lm->image_width;
-    float fh  = (float)lm->image_height;
+      if (fw > 0.f && fh > 0.f && pcw > 0.f && pch > 0.f) {
+        for (auto& x : lm->landmarks_x) x = (x / fw) * pcw + padded.x1;
+        for (auto& y : lm->landmarks_y) y = (y / fh) * pch + padded.y1;
+      }
 
-    if (fw > 0.f && fh > 0.f && pcw > 0.f && pch > 0.f) {
-      for (auto& x : lm->landmarks_x) x = (x / fw) * pcw + padded.x1;
-      for (auto& y : lm->landmarks_y) y = (y / fh) * pch + padded.y1;
+      py::dict box_d = det_list[i].cast<py::dict>();
+      py::dict d;
+      d[py::str("x1")]         = box_d["x1"].cast<float>();
+      d[py::str("y1")]         = box_d["y1"].cast<float>();
+      d[py::str("x2")]         = box_d["x2"].cast<float>();
+      d[py::str("y2")]         = box_d["y2"].cast<float>();
+      d[py::str("score")]      = box_d.contains("score")
+                                     ? box_d["score"].cast<float>() : 1.0f;
+      d[py::str("class_id")]   = 0;
+      d[py::str("class_name")] = std::string("face");
+
+      py::list landmarks;
+      for (size_t j = 0; j < lm->landmarks_x.size(); ++j) {
+        py::list pt;
+        pt.append(lm->landmarks_x[j]);
+        pt.append(lm->landmarks_y[j]);
+        landmarks.append(pt);
+      }
+      d[py::str("landmarks")] = landmarks;
+
+      if (!lm->landmarks_score.empty()) {
+        py::list ls;
+        for (auto s : lm->landmarks_score) ls.append(s);
+        d[py::str("landmarks_score")] = ls;
+      }
+      result.append(d);
+      continue;
     }
 
-    // Return the ORIGINAL (non-padded) bbox for clean visualisation so the
-    // drawn box matches the face detector output, not the padded crop.
-    py::dict box_d = det_list[i].cast<py::dict>();
-    float x1 = box_d["x1"].cast<float>();
-    float y1 = box_d["y1"].cast<float>();
-    float x2 = box_d["x2"].cast<float>();
-    float y2 = box_d["y2"].cast<float>();
+    // ── CLS_ATTRIBUTE (face attributes stage-2) ──────────────────────────
+    auto attr = std::dynamic_pointer_cast<ModelAttributeInfo>(out_datas[i]);
+    if (attr) {
+      py::dict box_d = det_list[i].cast<py::dict>();
+      py::dict d;
+      d[py::str("x1")]         = box_d["x1"].cast<float>();
+      d[py::str("y1")]         = box_d["y1"].cast<float>();
+      d[py::str("x2")]         = box_d["x2"].cast<float>();
+      d[py::str("y2")]         = box_d["y2"].cast<float>();
+      d[py::str("score")]      = box_d.contains("score")
+                                     ? box_d["score"].cast<float>() : 1.0f;
+      d[py::str("class_id")]   = 0;
+      d[py::str("class_name")] = std::string("face");
 
-    // Return dict in OBJECT_DETECTION_WITH_LANDMARKS format so _draw_inference
-    // draws both the face bbox (draw_detections) and the landmark dots
-    // (draw_keypoints) without any extra logic in the Python sample.
-    py::dict d;
-    d[py::str("x1")]         = x1;
-    d[py::str("y1")]         = y1;
-    d[py::str("x2")]         = x2;
-    d[py::str("y2")]         = y2;
-    d[py::str("score")]      = box_d.contains("score")
-                                   ? box_d["score"].cast<float>() : 1.0f;
-    d[py::str("class_id")]   = 0;
-    d[py::str("class_name")] = std::string("face");
+      // Merge attribute scores into the face dict (same keys as outputParse).
+      for (const auto& kv : attr->attributes) {
+        auto it = kAttrName.find(static_cast<int>(kv.first));
+        std::string name = (it != kAttrName.end())
+                           ? it->second
+                           : ("attr_" + std::to_string(static_cast<int>(kv.first)));
+        float score = kv.second;
+        d[py::str(name + "_score")] = score;
 
-    py::list landmarks;
-    for (size_t j = 0; j < lm->landmarks_x.size(); ++j) {
-      py::list pt;
-      pt.append(lm->landmarks_x[j]);
-      pt.append(lm->landmarks_y[j]);
-      landmarks.append(pt);
+        if (name == "gender") {
+          d[py::str("is_male")] = py::bool_(score > 0.5f);
+        } else if (name == "age") {
+          d[py::str("age")] = static_cast<int>(score * 100.f);
+        } else if (name == "mask") {
+          d[py::str("is_wearing_mask")] = py::bool_(score > 0.5f);
+        } else if (name == "hat") {
+          d[py::str("is_wearing_hat")] = py::bool_(score > 0.5f);
+        } else if (name == "glasses") {
+          d[py::str("is_wearing_glasses")] = py::bool_(score > 0.5f);
+        } else if (name == "emotion") {
+          static const char* kEmotionNames[7] = {
+              "anger", "disgust", "fear", "happy",
+              "neutral", "sad", "surprise"};
+          int idx = static_cast<int>(score);
+          d[py::str("emotion")] =
+              (idx >= 0 && idx < 7) ? std::string(kEmotionNames[idx])
+                                    : std::string("unknown");
+        }
+      }
+      result.append(d);
+      continue;
     }
-    d[py::str("landmarks")] = landmarks;
 
-    if (!lm->landmarks_score.empty()) {
-      py::list ls;
-      for (auto s : lm->landmarks_score) ls.append(s);
-      d[py::str("landmarks_score")] = ls;
+    // ── Classification (top-k) ───────────────────────────────────────────
+    auto cls = std::dynamic_pointer_cast<ModelClassificationInfo>(out_datas[i]);
+    if (cls && !cls->topk_class_ids.empty()) {
+      py::dict box_d = det_list[i].cast<py::dict>();
+      py::dict d;
+      d[py::str("x1")]         = box_d["x1"].cast<float>();
+      d[py::str("y1")]         = box_d["y1"].cast<float>();
+      d[py::str("x2")]         = box_d["x2"].cast<float>();
+      d[py::str("y2")]         = box_d["y2"].cast<float>();
+      d[py::str("score")]      = cls->topk_scores[0];
+      d[py::str("class_id")]   = cls->topk_class_ids[0];
+      d[py::str("class_name")] = std::string("face");
+      result.append(d);
+      continue;
     }
-    result.append(d);
   }
   return result;
 }
@@ -290,8 +358,18 @@ py::list PyModel::outputParse(
         d[py::str("is_wearing_hat")] = py::bool_(score > 0.5f);
       } else if (name == "glasses") {
         d[py::str("is_wearing_glasses")] = py::bool_(score > 0.5f);
+      } else if (name == "emotion") {
+        // Emotion "score" from the model is an argmax class index (0..6).
+        // Expose the literal label so callers can format it directly.
+        static const char* kEmotionNames[7] = {
+            "anger", "disgust", "fear", "happy",
+            "neutral", "sad", "surprise"};
+        int idx = static_cast<int>(score);
+        d[py::str("emotion")] =
+            (idx >= 0 && idx < 7) ? std::string(kEmotionNames[idx])
+                                  : std::string("unknown");
       }
-      // emotion / pose / blurness / unknown: raw score is enough
+      // pose / blurness / unknown: raw score is enough
     }
 
     py::list result;

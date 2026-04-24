@@ -4,8 +4,10 @@
 #include "py_matcher.hpp"
 #include "py_model.hpp"
 #include "py_rtsp.hpp"
+#include "py_video_recorder.hpp"
 #ifdef HAVE_OPENCV_VIDEOIO
 #include "py_rtsp_client.hpp"
+#include "py_usb_camera.hpp"
 #endif
 #include "py_rtsp_client_vdec.hpp"
 #include "utils/tokenizer_bpe.hpp"
@@ -140,6 +142,37 @@ PYBIND11_MODULE(tdl, m) {
       .def("__exit__", &PyRtspClient::exit);
 #endif  // HAVE_OPENCV_VIDEOIO
 
+#ifdef HAVE_OPENCV_VIDEOIO
+  // USB camera capture via V4L2 (OpenCV VideoCapture backend)
+  py::class_<PyUsbCamera>(image, "UsbCamera")
+      .def(py::init<int, int, int>(),
+           py::arg("device") = 0,
+           py::arg("width")  = 640,
+           py::arg("height") = 480,
+           "Open a USB (UVC) camera via V4L2.\n"
+           "device: V4L2 device index (0 = /dev/video0, 1 = /dev/video1, ...).\n"
+           "width / height: requested capture resolution.\n"
+           "Frames are returned as VPSSImage (NV12) compatible with\n"
+           "model.inference(), RTSPServer.send_frame(), and all draw_* functions.\n"
+           "If the camera natively outputs NV12, no color conversion is performed.")
+      .def("read", &PyUsbCamera::read,
+           "Capture the next frame and return it as a VPSSImage (NV12).\n"
+           "Compatible with model.inference() and RTSPServer.send_frame().\n"
+           "Raises RuntimeError on failure.")
+      .def("release", &PyUsbCamera::release,
+           "No-op. Provided for API compatibility with Camera.")
+      .def("close", &PyUsbCamera::close,
+           "Close the device and free resources.")
+      .def_property_readonly("width", &PyUsbCamera::getWidth,
+           "Actual capture width in pixels")
+      .def_property_readonly("height", &PyUsbCamera::getHeight,
+           "Actual capture height in pixels")
+      .def("is_opened", &PyUsbCamera::isOpened,
+           "Return True if the device is open.")
+      .def("__enter__", &PyUsbCamera::enter, py::return_value_policy::reference)
+      .def("__exit__", &PyUsbCamera::exit);
+#endif  // HAVE_OPENCV_VIDEOIO
+
   // Hardware-accelerated RTSP client (live555 + VDEC)
   py::class_<PyRtspClientVdec>(image, "RtspClientVdec")
       .def(py::init<const std::string&, int, int, int, const std::string&>(),
@@ -199,6 +232,55 @@ PYBIND11_MODULE(tdl, m) {
       .def("__enter__", &PyRTSP::enter, py::return_value_policy::reference)
       .def("__exit__", &PyRTSP::exit);
 
+  // Hardware DVR recorder: encodes VPSSImage frames with VENC and writes
+  // time-rotated MP4 segments (one JPEG thumbnail per segment).
+  py::class_<PyVideoRecorder>(image, "VideoRecorder")
+      .def(py::init<int32_t, int32_t, const std::string&,
+                    const std::string&, int32_t, int32_t, int32_t,
+                    int32_t, int32_t, int32_t>(),
+           py::arg("width"), py::arg("height"), py::arg("out_dir"),
+           py::arg("codec") = "h264",
+           py::arg("segment_seconds") = 30,
+           py::arg("fps") = 15,
+           py::arg("bitrate") = 3072,
+           py::arg("gop") = 15,
+           py::arg("chn") = 0,
+           py::arg("jpeg_chn") = 1,
+           "Create a hardware video recorder that writes MP4 segments.\n"
+           "out_dir: output directory (created if missing, e.g. '/mnt/sd/dvr').\n"
+           "codec: 'h264' or 'h265'.\n"
+           "segment_seconds: segment duration before rotating to a new file.\n"
+           "fps: must match the rate at which send_frame() is called.\n"
+           "bitrate: VENC bitrate in kbps (CBR).\n"
+           "gop: keyframe interval in frames (smaller = better seek).\n"
+           "chn: VENC channel for video encoding (default 0).\n"
+           "jpeg_chn: VENC channel used transiently for JPEG thumbnails "
+           "(default 1).  Do not reuse either channel with RTSPServer.")
+      .def("send_frame", &PyVideoRecorder::sendFrame, py::arg("frame"),
+           "Encode one hardware frame and append to the current segment.\n"
+           "Rotates to a new MP4 file once segment_seconds has elapsed "
+           "(rotation happens at the next keyframe).")
+      .def("rotate", &PyVideoRecorder::rotate,
+           "Request the current segment to be closed at the next keyframe.")
+      .def("close", &PyVideoRecorder::close,
+           "Finalize the current MP4 segment and release VENC resources.")
+      .def("current_segment", &PyVideoRecorder::currentSegment,
+           "Basename (no directory) of the segment being written, "
+           "or '' if no segment is open yet.")
+      .def("output_dir", &PyVideoRecorder::outputDir,
+           "Output directory as passed to the constructor.")
+      .def("segment_start_ms", &PyVideoRecorder::segmentStartMs,
+           "Wall-clock epoch time (ms) when the current segment was opened.\n"
+           "Returns 0 while no segment is open. Use it to align sidecar\n"
+           "files (e.g. detection JSONL) with the MP4 PTS timeline.")
+      .def("history", &PyVideoRecorder::history,
+           "List of dicts describing all closed segments since start.\n"
+           "Keys: filename, thumbnail, size_bytes, started_ms, "
+           "duration_ms, frame_count.")
+      .def("__enter__", &PyVideoRecorder::enter,
+           py::return_value_policy::reference)
+      .def("__exit__", &PyVideoRecorder::exit);
+
   // Draw utilities (operate in-place on hardware camera frames)
   image.def("draw_bbox", &drawBbox,
             py::arg("frame"), py::arg("x1"), py::arg("y1"),
@@ -248,6 +330,39 @@ PYBIND11_MODULE(tdl, m) {
             py::arg("frame"), py::arg("result"),
             "Draw OCR text result at the bottom of the frame (OCR_INFO).");
 
+  image.def("draw_crop_overlay", &drawCropOverlay,
+            py::arg("frame"), py::arg("x1"), py::arg("y1"),
+            py::arg("x2"), py::arg("y2"),
+            py::arg("thumb_size") = 96, py::arg("pad_ratio") = 0.2f,
+            "Debug: draw a thumbnail of a face crop region in the bottom-right\n"
+            "corner of the frame. x1,y1,x2,y2: face bounding box.\n"
+            "thumb_size: thumbnail size in px (default 96).\n"
+            "pad_ratio: padding around face (default 0.2 = 20%%).");
+
+  image.def("capture_face_crop", &captureFaceCrop,
+            py::arg("frame"), py::arg("x1"), py::arg("y1"),
+            py::arg("x2"), py::arg("y2"),
+            py::arg("thumb_size") = 96, py::arg("pad_ratio") = 0.2f,
+            "Capture a pristine snapshot of the face crop region BEFORE any\n"
+            "bbox/label drawing. Returns an opaque dict to be passed to\n"
+            "draw_face_thumbnail after the drawings are done. Returns an empty\n"
+            "dict if the crop is invalid (then draw_face_thumbnail is a no-op).");
+
+  image.def("draw_face_thumbnail", &drawFaceThumbnail,
+            py::arg("frame"), py::arg("snapshot"),
+            "Paint the face thumbnail captured by capture_face_crop into the\n"
+            "bottom-right corner of the frame. Call this AFTER draw_detections\n"
+            "and draw_classification so the preview is not contaminated by\n"
+            "bbox/label pixels.");
+
+  image.def("get_thumbnail_rect", &getThumbnailRect,
+            py::arg("frame"), py::arg("thumb_size") = 96,
+            "Return (x1, y1, x2, y2) of the worst-case thumbnail rectangle in\n"
+            "frame pixel coordinates, including the white border. Use this to\n"
+            "drop face detections whose bbox falls inside the thumbnail region\n"
+            "(they are the detector re-detecting the thumbnail painted on the\n"
+            "previous frame).");
+
   image.def("frame_to_jpeg", &frameToJpeg,
             py::arg("frame"), py::arg("quality") = 80, py::arg("scale") = 1.0f,
             "Convert a hardware camera frame (VPSSImage) to JPEG bytes.\n"
@@ -296,6 +411,9 @@ PYBIND11_MODULE(tdl, m) {
       .def("get_soft_nms", &PyModel::getSoftNms)
       .def("get_input_names", &PyModel::getInputNames)
       .def("get_output_names", &PyModel::getOutputNames)
+      .def("get_last_inference_ms", &PyModel::getLastInferenceMs,
+           "Time of the last inference call in milliseconds (VPSS + NPU), "
+           "measured inside C++ without Python GIL overhead.")
       .def("inference_with_detections",
            &PyModel::inferenceWithDetections,
            py::arg("image"), py::arg("detections"),

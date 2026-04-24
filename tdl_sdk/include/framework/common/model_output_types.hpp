@@ -54,10 +54,10 @@ class ObjectBoxLandmarkInfo {
  public:
   ObjectBoxLandmarkInfo() = default;
 
-  int32_t class_id;
+  int32_t class_id = 0;
   TDLObjectType object_type = OBJECT_TYPE_UNDEFINED;
-  float score;
-  float x1, y1, x2, y2;
+  float score = 0.0f;
+  float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
   std::vector<float> landmarks_x;
   std::vector<float> landmarks_y;
   std::vector<float> landmarks_score;

@@ -8,17 +8,27 @@ O FFmpeg atua como proxy interno RTSP→FLV sem re-encoding.
 
 Requer: ffmpeg disponível no PATH do dispositivo.
 
-Uso:
+Suporta três fontes de vídeo (--input):
+  vazio         câmera VI local (padrão)
+  rtsp://...    stream RTSP decodificado por hardware (VDEC)
+  usb / usb:N   câmera USB /dev/video0 (ou /dev/videoN)
+
+Uso (câmera VI — model type auto-detectado):
+    python3 sample_rtsp_webserver.py \\
+        --model /root/cv181x/scrfd_det_face_432_768_INT8_cv181x.cvimodel
+
+Uso (câmera VI — parâmetros explícitos):
     python3 sample_rtsp_webserver.py \\
         --model /root/cv181x/scrfd_det_face_432_768_INT8_cv181x.cvimodel \\
-        [--model-type SCRFD_DET_FACE] \\
-        [--width 1280] [--height 720] \\
-        [--threshold 0.5] \\
-        [--codec h264] [--bitrate 3072] [--gop 15] [--skip-every 1] [--persist-detections] \\
-        [--session live] \\
-        [--web-port 9000] \\
-        [--labels "classe0,classe1"] \\
-        [--mirror] [--flip]
+        --model-type SCRFD_DET_FACE [--width 1280] [--height 720]
+
+Uso (entrada RTSP — resolução auto-detectada):
+    python3 sample_rtsp_webserver.py \\
+        --model ... --input rtsp://192.168.1.10:554/live [--transport tcp|udp]
+
+Uso (câmera USB):
+    python3 sample_rtsp_webserver.py \\
+        --model ... --input usb
 
 Pipeline dois estágios (ex: SCRFD → KEYPOINT_FACE_V2):
     python3 sample_rtsp_webserver.py \\
@@ -26,7 +36,8 @@ Pipeline dois estágios (ex: SCRFD → KEYPOINT_FACE_V2):
         --model-type KEYPOINT_FACE_V2 \\
         --stage1-model /root/cv181x/scrfd_det_face_432_768_INT8_cv181x.cvimodel \\
         --stage1-model-type SCRFD_DET_FACE
-O detector facial (Stage-1) também pode ser configurado na interface web em tempo real.
+Na interface web, ao selecionar um detector facial, a opção de stage-2
+(keypoints/landmarks/atributos faciais) aparece automaticamente.
 
 Acesso:
     http://<ip-do-dispositivo>:9000/
@@ -62,6 +73,64 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
 import tdl
 from tdl import image, nn
+
+
+# ─── Auto-detecção de modelo e resolução ─────────────────────────────────────
+
+def _detect_model_type(model_path):
+    """Infere o ModelType a partir do nome do arquivo .cvimodel."""
+    basename = os.path.basename(model_path).lower().replace("_", "")
+    _auto_map = [
+        ("keypointyolov8poseperson17", "KEYPOINT_YOLOV8POSE_PERSON17"),
+        ("scrfddetface",        "SCRFD_DET_FACE"),
+        ("yolov8detcoco80",     "YOLOV8_DET_COCO80"),
+        ("yolov8ndetcoco80",    "YOLOV8_DET_COCO80"),
+        ("yolov11ndetcoco80",   "YOLOV11N_DET_COCO80"),
+        ("yolo11ndetcoco80",    "YOLOV11N_DET_COCO80"),
+        ("yolo11detcoco80",     "YOLOV11N_DET_COCO80"),
+        ("yolo26detcoco80",     "YOLOV26_DET_COCO80"),
+        ("yoloxdetcoco80",      "YOLOX_DET_COCO80"),
+        ("yolov10detcoco80",    "YOLOV10_DET_COCO80"),
+        ("yolov7detcoco80",     "YOLOV7_DET_COCO80"),
+        ("yolov6detcoco80",     "YOLOV6_DET_COCO80"),
+        ("yolov5detcoco80",     "YOLOV5_DET_COCO80"),
+    ]
+    for pattern, enum_name in _auto_map:
+        if pattern in basename:
+            return enum_name
+    return None
+
+
+def _probe_rtsp_resolution(url, transport="tcp"):
+    """Conecta brevemente ao stream RTSP via OpenCV para descobrir a resolução.
+
+    Retorna (width, height) ou (0, 0) se não conseguir.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return 0, 0
+    try:
+        env_key = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
+        old = os.environ.get(env_key, "")
+        os.environ[env_key] = f"rtsp_transport;{transport}"
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        if old:
+            os.environ[env_key] = old
+        else:
+            os.environ.pop(env_key, None)
+
+        if not cap.isOpened():
+            return 0, 0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return 0, 0
+
 
 # ─── COCO80 class names ───────────────────────────────────────────────────────
 
@@ -157,6 +226,31 @@ def _draw_inference(frame, dets, is_keypoint: bool, threshold: float):
             if "landmarks" in first and "x1" not in first:
                 image.draw_keypoints(frame, dets, score_threshold=threshold)
                 return
+            # Two-stage face + CLS_ATTRIBUTE: has bbox AND attribute scores
+            if "x1" in first and any(
+                    k.endswith("_score") for k in first):
+                # The thumbnail painted in the previous frame persists in the
+                # VB buffer that the detector saw this frame, so SCRFD can
+                # latch onto it as a second face. Drop any detection whose
+                # center falls inside the thumbnail rectangle.
+                tx1, ty1, tx2, ty2 = image.get_thumbnail_rect(
+                    frame, thumb_size=96)
+                dets = [d for d in dets
+                        if not (tx1 <= 0.5 * (d["x1"] + d["x2"]) < tx2 and
+                                ty1 <= 0.5 * (d["y1"] + d["y2"]) < ty2)]
+                if not dets:
+                    return
+                first = dets[0]
+                # Capture the pristine face pixels BEFORE any bbox/label draw
+                # contaminates the frame, then paint the preview LAST so the
+                # thumbnail shows exactly what the stage-2 model saw.
+                snapshot = image.capture_face_crop(
+                    frame, first["x1"], first["y1"],
+                    first["x2"], first["y2"], thumb_size=96)
+                image.draw_detections(frame, dets, score_threshold=threshold)
+                image.draw_classification(frame, dets)
+                image.draw_face_thumbnail(frame, snapshot)
+                return
             # CLASSIFICATION / CLS_ATTRIBUTE: no bbox, no landmarks
             if "x1" not in first and "landmarks" not in first and (
                     "class_id" in first or any(
@@ -200,9 +294,11 @@ _running            = True
 _persist_detections = False   # configurado em main() via args.persist_detections
 _last_detect_frame  = -1      # frame_idx da última inferência positiva
 
-_infer_fps   = 0.0
-_infer_ms    = 0.0
-_cam_fps     = 0.0
+_infer_fps       = 0.0
+_infer_ms        = 0.0
+_infer_ms_acc    = 0.0      # acumulador para média por janela de reporte
+_infer_count_window = 0     # contagem de inferências na janela actual
+_cam_fps         = 0.0
 _frame_count = 0
 _det_total   = 0
 
@@ -262,10 +358,12 @@ _MAX_RELEASE_PENDING = 2   # máx. frames aguardando além do que está em infer
 
 # Pool de VB blocks da câmera — ver comentário análogo em sample_rtsp_server.py.
 _VB_BUFFER_NUM = 5   # pool size passado ao Camera(); semáforo = _VB_BUFFER_NUM - 2
+_source_type   = "vi"   # "vi" | "vdec" | "usb"
 
 
 def _inference_worker(cam, vb_sem):
-    global _running, _infer_fps, _infer_ms, _last_detect_frame
+    global _running, _infer_fps, _infer_ms, _last_detect_frame, _source_type
+    global _infer_ms_acc, _infer_count_window
     t0    = time.time()
     count = 0
     while _running:
@@ -288,10 +386,10 @@ def _inference_worker(cam, vb_sem):
                 stage1 = _stage1_detector
                 if det is not None:
                     try:
-                        ti = time.time()
                         mt = _current_model_type.upper()
                         use_two_stage = (stage1 is not None and
-                                         ("KEYPOINT" in mt or "LANDMARK" in mt))
+                                         ("KEYPOINT" in mt or "LANDMARK" in mt
+                                          or "CLS_ATTRIBUTE" in mt))
                         if use_two_stage:
                             # Pipeline dois estágios: faces → landmarks
                             faces = stage1.inference(frame)
@@ -299,9 +397,15 @@ def _inference_worker(cam, vb_sem):
                                     if faces else []
                         else:
                             dets = det.inference(frame)
-                        _infer_ms = (time.time() - ti) * 1000
+                        # Use C++ steady_clock measurement (excludes GIL wait time).
+                        _infer_ms = det.get_last_inference_ms()
+                        _infer_ms_acc += _infer_ms
+                        _infer_count_window += 1
                         with _det_lock:
-                            _last_detections[:] = dets
+                            if isinstance(dets, (list, tuple)):
+                                _last_detections[:] = dets
+                            else:
+                                _last_detections[:] = [dets] if dets else []
                             if dets:
                                 _last_detect_frame = _frame_count
                     except Exception as e:
@@ -312,9 +416,17 @@ def _inference_worker(cam, vb_sem):
                     if elapsed > 0:
                         _infer_fps = count / elapsed
 
-        # Sempre libera em ordem FIFO — nunca camera_loop chama cam.release()
-        cam.release()
-        vb_sem.release()   # libera um slot do pool para o main thread
+        # Libera de acordo com a fonte:
+        # vi:   cam.release() FIFO + semáforo
+        # vdec: release_inference() (slot pinado pelo camera_loop)
+        # usb:  cam.release() no-op; sem semáforo
+        if _source_type == "vi":
+            cam.release()
+            vb_sem.release()
+        elif _source_type == "vdec":
+            cam.release_inference()
+        else:
+            cam.release()
 
 
 # ─── Model hot-swap helpers ───────────────────────────────────────────────────
@@ -477,8 +589,68 @@ def _do_switch_stage1(model_type_name: str, model_path: str) -> tuple:
 # ─── Main camera + RTSP loop ──────────────────────────────────────────────────
 
 
+def _open_source(args):
+    """Abre a fonte de vídeo conforme --input e retorna (cam, source_type)."""
+    inp = args.input.strip()
+    if inp.lower().startswith("usb"):
+        device = 0
+        if ":" in inp:
+            try:
+                device = int(inp.split(":", 1)[1])
+            except ValueError:
+                pass
+        if not hasattr(image, "UsbCamera"):
+            print("[ERRO] UsbCamera não disponível nesta build (requer OpenCV videoio).")
+            sys.exit(1)
+        req_w = args.width if args.width else 640
+        req_h = args.height if args.height else 480
+        print(f"\nAbrindo câmera USB /dev/video{device}  {req_w}x{req_h} ...")
+        cam = image.UsbCamera(device, req_w, req_h)
+        if not cam.is_opened():
+            print(f"[ERRO] Não foi possível abrir /dev/video{device}.")
+            sys.exit(1)
+        if hasattr(cam, 'width') and hasattr(cam, 'height'):
+            args.width, args.height = cam.width, cam.height
+        else:
+            args.width, args.height = req_w, req_h
+        print(f"  Backend: USB V4L2 /dev/video{device}  {args.width}x{args.height}")
+        return cam, "usb"
+    elif inp.startswith("rtsp://") or inp.startswith("rtsps://"):
+        w, h = args.width, args.height
+        if w == 0 or h == 0:
+            print(f"\nAuto-detectando resolução de {inp} ...")
+            w, h = _probe_rtsp_resolution(inp, args.transport)
+            if w > 0 and h > 0:
+                print(f"  Resolução detectada: {w}x{h}")
+                args.width, args.height = w, h
+            else:
+                print("[ERRO] Não foi possível detectar resolução do stream RTSP.\n"
+                      "  Especifique manualmente com --width e --height.")
+                sys.exit(1)
+        print(f"\nAbrindo stream RTSP {inp} ({args.transport}) ...")
+        cam = image.RtspClientVdec(inp, width=w, height=h,
+                                   transport=args.transport)
+        if not cam.is_opened():
+            print("[ERRO] Não foi possível abrir o stream RTSP.")
+            sys.exit(1)
+        print(f"  Backend: VDEC hardware (H264)  {w}x{h}")
+        return cam, "vdec"
+    else:
+        if args.width == 0:
+            args.width = 1280
+        if args.height == 0:
+            args.height = 720
+        print(f"\nAbrindo câmera VI {args.width}x{args.height} ...")
+        cam = image.Camera(args.width, args.height, image.ImageFormat.YUV420SP_VU,
+                           vb_buffer_num=_VB_BUFFER_NUM,
+                           mirror=args.mirror, flip=args.flip)
+        print("  Backend: câmera VI local")
+        return cam, "vi"
+
+
 def camera_loop(args, rtsp):
-    global _running, _cam_fps, _frame_count, _det_total, _status
+    global _running, _cam_fps, _frame_count, _det_total, _status, _source_type
+    global _infer_ms_acc, _infer_count_window
 
     with _detector_lock:
         _status = "Running" if _detector is not None else "Aguardando modelo"
@@ -493,12 +665,9 @@ def camera_loop(args, rtsp):
     _send_ms_acc = 0.0
     _acc_count   = 0
 
-    cam = image.Camera(args.width, args.height, image.ImageFormat.YUV420SP_VU,
-                       vb_buffer_num=_VB_BUFFER_NUM,
-                       mirror=args.mirror, flip=args.flip)
+    cam, _source_type = _open_source(args)
 
-    # Semáforo limita frames em user space a (_VB_BUFFER_NUM - 2), evitando
-    # esgotamento do pool de VB blocks e stall do ISP.
+    # Semáforo apenas para câmera VI (VB pool limitado).
     vb_sem = threading.Semaphore(_VB_BUFFER_NUM - 2)
 
     # Thread de inferência/release iniciada aqui, depois de cam ser criada,
@@ -509,8 +678,8 @@ def camera_loop(args, rtsp):
 
     try:
         while _running and (limit is None or frame_idx < limit):
-            # Aguarda um slot livre antes de ler o próximo frame.
-            if not vb_sem.acquire(timeout=0.5):
+            # Semáforo apenas para VI; VDEC e USB gerenciam própria memória.
+            if _source_type == "vi" and not vb_sem.acquire(timeout=0.5):
                 continue   # timeout — verifica _running e tenta de novo
             t0    = time.time()
             frame = cam.read()
@@ -544,14 +713,24 @@ def camera_loop(args, rtsp):
                     global _latest_jpeg
                     _latest_jpeg = jpeg
 
-            # Enfileira APÓS rtsp.send_frame e frame_to_jpeg: o main thread
-            # já terminou de usar o VB block; a thread de inferência pode
-            # agora acessá-lo e depois liberá-lo em ordem FIFO via cam.release().
+            # Para RtspClientVdec: pina o frame para a thread de inferência e
+            # libera o slot de display antes do próximo read().
+            if _source_type == "vdec":
+                cam.pin_for_inference()
+
+            # Enfileira APÓS rtsp.send_frame e frame_to_jpeg.
             do_infer = (frame_idx % skip_every == 0)
             with _release_lock:
                 if len(_release_queue) >= _MAX_RELEASE_PENDING:
                     do_infer = False
-                _release_queue.append((frame, do_infer))
+                # USB: cam.release() é no-op, então frames sem inferência
+                # não precisam da fila — VB blocks liberados pelo GC quando
+                # a referência local 'frame' é sobrescrita no próximo read().
+                if do_infer or _source_type != "usb":
+                    _release_queue.append((frame, do_infer))
+
+            if _source_type == "vdec":
+                cam.release()  # libera slot de display; inferência usa slot pinado
 
             frame_idx += 1
 
@@ -567,14 +746,18 @@ def camera_loop(args, rtsp):
 
             if now - t_report >= 5.0:
                 n = max(_acc_count, 1)
+                ni = max(_infer_count_window, 1)
+                avg_infer = _infer_ms_acc / ni
                 print(f"  frame {frame_idx:6d}  "
                       f"cam={_cam_fps:5.1f}fps  "
                       f"inf={_infer_fps:4.1f}fps  "
                       f"dets={len(dets)}  "
                       f"| read={_cam_ms_acc/n:5.1f}ms  "
-                      f"inf={_infer_ms:5.1f}ms  "
+                      f"inf={avg_infer:5.1f}ms  "
                       f"draw={_draw_ms_acc/n:4.1f}ms  "
                       f"send={_send_ms_acc/n:5.1f}ms")
+                _infer_ms_acc = 0.0
+                _infer_count_window = 0
                 _cam_ms_acc = _draw_ms_acc = _send_ms_acc = 0.0
                 _acc_count  = 0
                 t_report    = now
@@ -584,7 +767,8 @@ def camera_loop(args, rtsp):
         print(f"\n[ERRO] {exc}")
     finally:
         _running = False
-        vb_sem.release()   # desbloqueia acquire() caso esteja esperando
+        if _source_type == "vi":
+            vb_sem.release()   # desbloqueia acquire() caso esteja esperando
         infer_thread.join(timeout=2.0)
         # Frames pendentes na fila são descartados; cam.close() libera o
         # frameQueues interno do ViDecoder (todos os VB blocks restantes).
@@ -885,28 +1069,20 @@ HTML_PAGE = """\
         <select id="sel-file" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:5px 6px;font-family:var(--mono);font-size:11px;border-radius:3px">
           <option value="">-- cvimodel --</option>
         </select>
+        <div id="stage2-wrap" style="display:none;flex-direction:column;gap:8px;margin-top:4px;padding-top:8px;border-top:1px solid var(--border)">
+          <div style="font-family:var(--mono);font-size:10px;color:var(--accent2);letter-spacing:.05em">STAGE-2 (Landmarks / Keypoints / Atributos)</div>
+          <select id="sel-s2-type" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:5px 6px;font-family:var(--mono);font-size:11px;border-radius:3px">
+            <option value="">-- sem stage-2 --</option>
+          </select>
+          <select id="sel-s2-file" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:5px 6px;font-family:var(--mono);font-size:11px;border-radius:3px">
+            <option value="">-- cvimodel --</option>
+          </select>
+        </div>
         <button id="btn-switch" onclick="doSwitch()"
           style="background:var(--accent);color:#000;border:none;padding:7px;font-family:var(--mono);font-size:11px;font-weight:700;border-radius:3px;cursor:pointer;letter-spacing:.1em">
           APLICAR
         </button>
         <div id="switch-msg" style="font-family:var(--mono);font-size:10px;color:var(--dim);min-height:14px"></div>
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-title" title="Detector facial para modelos de dois estágios (ex: KEYPOINT_FACE_V2)">Detector Facial (Stage-1)</div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        <select id="sel-s1-type" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:5px 6px;font-family:var(--mono);font-size:11px;border-radius:3px">
-          <option value="">-- desativar stage-1 --</option>
-        </select>
-        <select id="sel-s1-file" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:5px 6px;font-family:var(--mono);font-size:11px;border-radius:3px">
-          <option value="">-- cvimodel --</option>
-        </select>
-        <button id="btn-s1-switch" onclick="doSwitchStage1()"
-          style="background:var(--accent2);color:#000;border:none;padding:7px;font-family:var(--mono);font-size:11px;font-weight:700;border-radius:3px;cursor:pointer;letter-spacing:.1em">
-          APLICAR
-        </button>
-        <div id="s1-switch-msg" style="font-family:var(--mono);font-size:10px;color:var(--dim);min-height:14px"></div>
       </div>
     </div>
   </aside>
@@ -1108,14 +1284,24 @@ async function poll() {
 setInterval(poll, 300);
 poll();
 
-// ─── Model selector ──────────────────────────────────────────────────────────
+// ─── Model selector (unified: main + optional stage-2) ──────────────────────
+
+// Face detectors that can serve as stage-1 for KEYPOINT/LANDMARK pipelines
+function isFaceDetector(t) {
+  return /SCRFD|RETINAFACE/.test(t) && /FACE/.test(t);
+}
+function isStage2Model(t) {
+  return /KEYPOINT|LANDMARK|CLS_ATTRIBUTE/.test(t);
+}
+
+let _allModelTypes = [];
 
 async function loadModelSelector() {
   try {
-    const types = await fetch('/api/models').then(r => r.json());
+    _allModelTypes = await fetch('/api/models').then(r => r.json());
     const selType = document.getElementById('sel-type');
     selType.innerHTML = '<option value="">-- model type --</option>';
-    types.forEach(t => {
+    _allModelTypes.forEach(t => {
       const o = document.createElement('option');
       o.value = o.textContent = t;
       selType.appendChild(o);
@@ -1126,15 +1312,12 @@ async function loadModelSelector() {
   }
 }
 
-async function onTypeChange(modelType) {
-  const selFile = document.getElementById('sel-file');
-  const msg     = document.getElementById('switch-msg');
+async function _populateFileSelector(selFile, modelType) {
   if (!modelType) {
     selFile.innerHTML = '<option value="">-- cvimodel --</option>';
     return;
   }
   selFile.innerHTML = '<option value="">Buscando...</option>';
-  msg.textContent   = '';
   try {
     const files = await fetch('/api/cvimodels?type=' + encodeURIComponent(modelType))
                     .then(r => r.json());
@@ -1156,28 +1339,70 @@ async function onTypeChange(modelType) {
   }
 }
 
-async function doSwitch() {
-  const modelType = document.getElementById('sel-type').value;
-  const modelPath = document.getElementById('sel-file').value;
-  const msg       = document.getElementById('switch-msg');
-  const btn       = document.getElementById('btn-switch');
+function onTypeChange(modelType) {
+  _populateFileSelector(document.getElementById('sel-file'), modelType);
+  document.getElementById('switch-msg').textContent = '';
 
-  if (!modelType || !modelPath) {
+  // Show/hide stage-2 section
+  const wrap = document.getElementById('stage2-wrap');
+  if (isFaceDetector(modelType)) {
+    wrap.style.display = 'flex';
+    // Populate stage-2 type selector with KEYPOINT/LANDMARK models
+    const selS2 = document.getElementById('sel-s2-type');
+    selS2.innerHTML = '<option value="">-- sem stage-2 --</option>';
+    _allModelTypes.filter(isStage2Model).forEach(t => {
+      const o = document.createElement('option');
+      o.value = o.textContent = t;
+      selS2.appendChild(o);
+    });
+    selS2.onchange = () => _populateFileSelector(
+      document.getElementById('sel-s2-file'), selS2.value);
+    // Reset stage-2 file
+    document.getElementById('sel-s2-file').innerHTML = '<option value="">-- cvimodel --</option>';
+  } else {
+    wrap.style.display = 'none';
+    document.getElementById('sel-s2-type').value = '';
+    document.getElementById('sel-s2-file').innerHTML = '<option value="">-- cvimodel --</option>';
+  }
+}
+
+async function doSwitch() {
+  const mainType = document.getElementById('sel-type').value;
+  const mainPath = document.getElementById('sel-file').value;
+  const msg      = document.getElementById('switch-msg');
+  const btn      = document.getElementById('btn-switch');
+
+  if (!mainType || !mainPath) {
     msg.style.color = 'var(--warn)';
     msg.textContent = 'Selecione tipo e arquivo';
+    return;
+  }
+
+  const s2Type = document.getElementById('sel-s2-type').value;
+  const s2Path = document.getElementById('sel-s2-file').value;
+  const hasTwoStage = isFaceDetector(mainType) && s2Type && s2Path;
+
+  if (isFaceDetector(mainType) && s2Type && !s2Path) {
+    msg.style.color = 'var(--warn)';
+    msg.textContent = 'Selecione o arquivo do stage-2';
     return;
   }
 
   btn.disabled    = true;
   btn.textContent = 'Aguarde...';
   msg.style.color = 'var(--dim)';
-  msg.textContent = 'Carregando...';
+  msg.textContent = hasTwoStage ? 'Carregando pipeline...' : 'Carregando...';
 
   try {
+    const payload = hasTwoStage
+      ? { model_type: s2Type, model_path: s2Path,
+          stage1_model_type: mainType, stage1_model_path: mainPath }
+      : { model_type: mainType, model_path: mainPath };
+
     const r = await fetch('/api/switch', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model_type: modelType, model_path: modelPath}),
+      body: JSON.stringify(payload),
     });
     const d = await r.json();
     msg.style.color = d.ok ? 'var(--accent2)' : 'var(--warn)';
@@ -1192,82 +1417,6 @@ async function doSwitch() {
 }
 
 loadModelSelector();
-
-// ─── Stage-1 (face detector) selector ────────────────────────────────────────
-
-async function loadS1Selector() {
-  try {
-    const types = await fetch('/api/models').then(r => r.json());
-    const selType = document.getElementById('sel-s1-type');
-    types.forEach(t => {
-      const o = document.createElement('option');
-      o.value = o.textContent = t;
-      selType.appendChild(o);
-    });
-    selType.onchange = () => onS1TypeChange(selType.value);
-  } catch(e) {}
-}
-
-async function onS1TypeChange(modelType) {
-  const selFile = document.getElementById('sel-s1-file');
-  if (!modelType) {
-    selFile.innerHTML = '<option value="">-- cvimodel --</option>';
-    return;
-  }
-  selFile.innerHTML = '<option value="">Buscando...</option>';
-  try {
-    const files = await fetch('/api/cvimodels?type=' + encodeURIComponent(modelType))
-                    .then(r => r.json());
-    selFile.innerHTML = '<option value="">-- cvimodel --</option>';
-    files.forEach(f => {
-      const o = document.createElement('option');
-      o.value = f;
-      o.textContent = f.split('/').pop();
-      o.title = f;
-      selFile.appendChild(o);
-    });
-    if (files.length === 1) selFile.value = files[0];
-  } catch(e) {
-    selFile.innerHTML = '<option value="">Erro</option>';
-  }
-}
-
-async function doSwitchStage1() {
-  const modelType = document.getElementById('sel-s1-type').value;
-  const modelPath = document.getElementById('sel-s1-file').value;
-  const msg       = document.getElementById('s1-switch-msg');
-  const btn       = document.getElementById('btn-s1-switch');
-
-  if (modelType && !modelPath) {
-    msg.style.color = 'var(--warn)';
-    msg.textContent = 'Selecione o arquivo .cvimodel';
-    return;
-  }
-
-  btn.disabled    = true;
-  btn.textContent = 'Aguarde...';
-  msg.style.color = 'var(--dim)';
-  msg.textContent = modelType ? 'Carregando...' : 'Desativando...';
-
-  try {
-    const r = await fetch('/api/switch_stage1', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model_type: modelType, model_path: modelPath}),
-    });
-    const d = await r.json();
-    msg.style.color = d.ok ? 'var(--accent2)' : 'var(--warn)';
-    msg.textContent = d.message;
-  } catch(e) {
-    msg.style.color = 'var(--warn)';
-    msg.textContent = 'Erro de comunicação';
-  } finally {
-    btn.disabled    = false;
-    btn.textContent = 'APLICAR';
-  }
-}
-
-loadS1Selector();
 </script>
 </body>
 </html>
@@ -1318,7 +1467,7 @@ class Handler(BaseHTTPRequestHandler):
                         "glasses":  lambda d, s: ("Glasses" if d.get("is_wearing_glasses") else "No glasses") + f" {s:.0%}",
                         "mask":     lambda d, s: ("Mask" if d.get("is_wearing_mask") else "No mask") + f" {s:.0%}",
                         "hat":      lambda d, s: ("Hat" if d.get("is_wearing_hat") else "No hat") + f" {s:.0%}",
-                        "emotion":  lambda d, s: f"Emotion {s:.2f}",
+                        "emotion":  lambda d, s: f"Emotion {d.get('emotion', f'{s:.2f}')}",
                         "pose":     lambda d, s: f"Pose {s:.2f}",
                         "blurness": lambda d, s: f"Blur {s:.2f}",
                     }
@@ -1384,17 +1533,25 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path in ("/api/switch", "/api/switch_stage1"):
+        if self.path == "/api/switch":
             length = int(self.headers.get("Content-Length", 0))
             body   = self.rfile.read(length)
             try:
                 req = json.loads(body)
-                if self.path == "/api/switch":
-                    ok, msg = _do_switch_model(req.get("model_type", ""),
-                                               req.get("model_path", ""))
-                else:
-                    ok, msg = _do_switch_stage1(req.get("model_type", ""),
-                                                req.get("model_path", ""))
+                ok, msg = _do_switch_model(req.get("model_type", ""),
+                                           req.get("model_path", ""))
+                if ok:
+                    s1_type = req.get("stage1_model_type", "")
+                    s1_path = req.get("stage1_model_path", "")
+                    if s1_type and s1_path:
+                        ok2, msg2 = _do_switch_stage1(s1_type, s1_path)
+                        if ok2:
+                            msg += " + " + msg2
+                        else:
+                            msg += " (stage-1 falhou: " + msg2 + ")"
+                    else:
+                        # Limpa stage-1 quando não há pipeline dois estágios
+                        _do_switch_stage1("", "")
             except Exception as e:
                 ok, msg = False, str(e)
             payload = json.dumps({"ok": ok, "message": msg}).encode()
@@ -1513,18 +1670,27 @@ def parse_args():
                    help="Caminho para o arquivo .cvimodel (opcional; pode ser "
                         "selecionado na interface web)")
     p.add_argument("--model-type", default="",
-                   help="Nome do ModelType (opcional; pode ser selecionado na "
-                        "interface web)")
-    p.add_argument("--width",     type=int, default=1280)
-    p.add_argument("--height",    type=int, default=720)
+                   help="Nome do ModelType (ex: SCRFD_DET_FACE). "
+                        "Auto-detectado pelo nome do arquivo se omitido; "
+                        "pode ser selecionado na interface web.")
+    p.add_argument("--width",     type=int, default=0,
+                   help="Largura em pixels (auto-detectado se omitido; "
+                        "padrão: 1280 para VI, 640 para USB)")
+    p.add_argument("--height",    type=int, default=0,
+                   help="Altura em pixels (auto-detectado se omitido; "
+                        "padrão: 720 para VI, 480 para USB)")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--codec",     default="h264", choices=["h264", "h265"])
     p.add_argument("--bitrate",   type=int, default=3072,
                    help="Bitrate de codificação em kbps (padrão: 3072). "
                         "Aumente para melhor qualidade em movimento (ex: 4096, 6144).")
-    p.add_argument("--gop",       type=int, default=15,
-                   help="Intervalo de keyframe em frames (padrão: 15). "
-                        "Menor = melhor qualidade em movimento; maior = melhor compressão estática.")
+    p.add_argument("--fps",       type=int, default=15,
+                   help="Frame rate declarado ao encoder VENC (padrão: 15). "
+                        "Deve refletir o FPS real da câmera — câmeras USB lentas podem exigir "
+                        "valores como 5 ou 10; valor errado causa GOP incorreto e stream estático.")
+    p.add_argument("--gop",       type=int, default=0,
+                   help="Intervalo de keyframe em frames (padrão: 0 = automático: 1× fps). "
+                        "Use 1 para câmeras USB lentas (todo frame é I-frame).")
     p.add_argument("--session",   default="live",
                    help="Nome da sessão RTSP (padrão: live)")
     p.add_argument("--frames",     type=int, default=0,
@@ -1537,16 +1703,22 @@ def parse_args():
                    help="Mantém a última detecção na tela enquanto não houver nova "
                         "detecção positiva (reduz flickering com --skip-every > 1).")
     p.add_argument("--web-port",   type=int, default=9000, dest="web_port")
+    p.add_argument("--input",     default="",
+                   help="Fonte de vídeo: vazio = câmera VI local; "
+                        "rtsp://... = stream RTSP (VDEC hardware); "
+                        "usb = /dev/video0; usb:1 = /dev/video1.")
+    p.add_argument("--transport", default="tcp", choices=["tcp", "udp"],
+                   help="Transporte RTSP de entrada (padrão: tcp)")
     p.add_argument("--mirror",    action="store_true", default=False,
-                   help="Espelhar horizontalmente (flip esquerda↔direita).")
+                   help="Espelhar horizontalmente (flip esquerda↔direita). Apenas câmera VI.")
     p.add_argument("--flip",      action="store_true", default=False,
-                   help="Inverter verticalmente (flip cima↔baixo).")
+                   help="Inverter verticalmente (flip cima↔baixo). Apenas câmera VI.")
     p.add_argument("--labels",    default="", dest="labels",
                    help="Nomes das classes: arquivo .txt ou 'cls0,cls1,...'")
     p.add_argument("--stage1-model", default="", dest="stage1_model",
                    help="Modelo do estágio 1 (ex: SCRFD) para pipeline dois estágios. "
-                        "Necessário para KEYPOINT_FACE_V2; pode ser configurado na "
-                        "interface web em 'Detector Facial (Stage-1)'.")
+                        "Necessário para KEYPOINT/LANDMARK/CLS_ATTRIBUTE; pode ser "
+                        "configurado na interface web.")
     p.add_argument("--stage1-model-type", default="SCRFD_DET_FACE",
                    dest="stage1_model_type",
                    help="ModelType do estágio 1 (padrão: SCRFD_DET_FACE).")
@@ -1571,33 +1743,43 @@ def main():
     except Exception as e:
         print(f"[AVISO] get_available_model_types: {e}")
 
+    # --- Model type (auto-detect se --model fornecido sem --model-type) ---
+    model_type_name = args.model_type
+    if args.model and not model_type_name:
+        model_type_name = _detect_model_type(args.model)
+        if model_type_name:
+            print(f"ModelType auto     : {model_type_name}")
+        else:
+            print("[AVISO] Não foi possível inferir --model-type pelo nome do arquivo.\n"
+                  "        Iniciando sem modelo — selecione na interface web.")
+
     # Modelo inicial (opcional)
-    if args.model and args.model_type:
+    if args.model and model_type_name:
         if args.labels:
             _custom_labels = _load_labels(args.labels)
             print(f"Labels carregados  : {len(_custom_labels)} classes (--labels)")
         else:
-            _custom_labels = _labels_from_factory(args.model_type)
+            _custom_labels = _labels_from_factory(model_type_name)
             if _custom_labels:
                 print(f"Labels carregados  : {len(_custom_labels)} classes (model_factory.json)")
 
-        model_type = getattr(nn.ModelType, args.model_type, None)
+        model_type = getattr(nn.ModelType, model_type_name, None)
         if model_type is None:
-            print(f"[ERRO] ModelType desconhecido: {args.model_type}")
+            print(f"[ERRO] ModelType desconhecido: {model_type_name}")
+            print("  Tipos disponíveis: " + ", ".join(
+                t for t in dir(nn.ModelType) if not t.startswith("_")))
             sys.exit(1)
 
         print(f"Carregando modelo  : {args.model}")
+        print(f"ModelType          : {model_type_name}")
         detector = nn.get_model(model_type, args.model)
         detector.set_threshold(args.threshold)
         print(f"Limiar             : {detector.get_threshold():.2f}")
 
         with _detector_lock:
             _detector           = detector
-            _current_model_type = args.model_type
-    elif args.model or args.model_type:
-        print("[AVISO] Forneça --model e --model-type juntos, ou nenhum dos dois.")
-        print("        Iniciando sem modelo — selecione na interface web.")
-    else:
+            _current_model_type = model_type_name
+    elif not args.model:
         print("Nenhum modelo inicial — selecione na interface web.")
 
     # Stage-1 detector inicial (opcional — pipeline dois estágios)
@@ -1607,12 +1789,55 @@ def main():
             print(f"[ERRO] {msg}")
             sys.exit(1)
 
-    # RTSP server
+    # --- Fonte de vídeo (aberta antes do RTSP para obter resolução auto-detectada) ---
+    global _source_type
+    _source_type_init = args.input.strip().lower()
+
+    # Auto-ajuste de fps/gop para câmera USB
+    fps = args.fps
+    bitrate = args.bitrate
+    if _source_type_init.startswith("usb") and fps > 10:
+        fps = 3
+        print(f"  [auto] FPS ajustado para {fps} (câmera USB geralmente entrega ≤5fps)")
+    if _source_type_init.startswith("usb") and args.bitrate >= 2048:
+        bitrate = 1024
+        print(f"  [auto] Bitrate ajustado para {bitrate}kbps (USB: NALUs menores → "
+              f"compatível com VLC/UDP)")
+    gop = args.gop if args.gop > 0 else max(1, fps)
+    if _source_type_init.startswith("usb") and args.gop <= 0:
+        gop = max(1, fps)
+        print(f"  [auto] GOP ajustado para {gop} (1 keyframe/s para câmera USB)")
+
+    # RTSP server (args.width/height pode ter sido atualizado pelo _open_source em camera_loop,
+    # mas para isso funcionar com auto-detect, precisamos abrir a fonte primeiro em camera_loop
+    # e usar as dimensões detectadas. Como a resolução precisa ser conhecida antes do RTSP server,
+    # fazemos o probe/default aqui.)
+    # Aplica defaults se width/height ainda são 0
+    if args.width == 0 or args.height == 0:
+        inp = args.input.strip()
+        if inp.lower().startswith("usb"):
+            if args.width == 0: args.width = 640
+            if args.height == 0: args.height = 480
+        elif inp.startswith("rtsp://") or inp.startswith("rtsps://"):
+            print(f"\nAuto-detectando resolução de {inp} ...")
+            pw, ph = _probe_rtsp_resolution(inp, args.transport)
+            if pw > 0 and ph > 0:
+                args.width, args.height = pw, ph
+                print(f"  Resolução detectada: {args.width}x{args.height}")
+            else:
+                print("[ERRO] Não foi possível detectar resolução do stream RTSP.\n"
+                      "  Especifique manualmente com --width e --height.")
+                sys.exit(1)
+        else:
+            if args.width == 0: args.width = 1280
+            if args.height == 0: args.height = 720
+
     print(f"\nIniciando servidor RTSP {args.width}x{args.height} "
-          f"codec={args.codec} bitrate={args.bitrate}kbps gop={args.gop} sessão={args.session} ...")
+          f"codec={args.codec} bitrate={bitrate}kbps fps={fps} "
+          f"gop={gop} ({gop/fps:.1f}s) sessão={args.session} ...")
     rtsp = image.RTSPServer(args.width, args.height, chn=0,
                             codec=args.codec, session_name=args.session,
-                            bitrate=args.bitrate, gop=args.gop)
+                            bitrate=bitrate, gop=gop, fps=fps)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))

@@ -262,6 +262,13 @@ int32_t BaseModel::inference(
     std::vector<std::shared_ptr<BaseImage>> batch_images;
     batch_rescale_params_[input_layer_name].clear();
 
+    // Track zero-copy redirect target.  Applied AFTER updateInputTensors()
+    // because that call resets any previous per-tensor paddr redirect; if we
+    // set the redirect before the reset, forward() ends up reading from the
+    // original tensor buffer (which was never written) and the TPU produces
+    // constant/stale outputs.
+    CviNet* pending_zero_copy_cvi = nullptr;
+    uint64_t pending_zero_copy_paddr = 0;
     for (int i = 0; i < fit_batch_size; i++) {
       batch_images.push_back(images[process_idx + i]);
       if (images[process_idx + i]->getImageType() == ImageType::TENSOR_FRAME) {
@@ -290,8 +297,8 @@ int32_t BaseModel::inference(
         postPreprocess(net_->getInputTensor(input_layer_name), i);
 
         if (zero_copy && vpss->getLastOutputPaddr() != 0) {
-          cvi->setInputTensorPhysicalAddr(input_layer_name,
-                                         vpss->getLastOutputPaddr());
+          pending_zero_copy_cvi   = cvi;
+          pending_zero_copy_paddr = vpss->getLastOutputPaddr();
         }
 
         std::vector<float> rescale_params = preprocessor_->getRescaleConfig(
@@ -302,6 +309,10 @@ int32_t BaseModel::inference(
     }
     model_timer_.TicToc("preprocess");
     net_->updateInputTensors();  // resets any physical addr redirect
+    if (pending_zero_copy_cvi != nullptr) {
+      pending_zero_copy_cvi->setInputTensorPhysicalAddr(input_layer_name,
+                                                         pending_zero_copy_paddr);
+    }
     net_->forward();
     model_timer_.TicToc("tpu");
     net_->updateOutputTensors();

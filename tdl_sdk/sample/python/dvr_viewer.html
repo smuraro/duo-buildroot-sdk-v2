@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TDL DVR — Visualizador</title>
+<!-- Se o HTML está na mesma pasta dos MP4s, um manifest.js gerado pelo
+     sample_dvr.py fica ao lado; carrega automaticamente sem pedir pasta.
+     Se não existir, o script cai no fluxo de seleção manual. -->
+<script src="manifest.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0a0c0f; --panel: #111318; --border: #1e222b;
+    --accent: #00e5ff; --dim: #6b7380; --text: #c8d0e0;
+    --mono: ui-monospace, Menlo, Consolas, monospace;
+  }
+  html, body { height: 100%; font-family: system-ui, sans-serif; }
+  body {
+    background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex-shrink: 0;
+  }
+  h1 {
+    font-size: 13px; font-weight: 600; letter-spacing: .2em;
+    text-transform: uppercase; color: var(--accent);
+  }
+  .hdr-info {
+    font-family: var(--mono); font-size: 11px; color: var(--dim);
+    margin-left: auto; display: flex; gap: 18px;
+  }
+  .hdr-info span.val { color: var(--text); }
+  .hdr-btn {
+    background: transparent; color: var(--accent);
+    border: 1px solid var(--accent); border-radius: 3px;
+    padding: 4px 12px; font: inherit; font-size: 10px; font-weight: 600;
+    letter-spacing: .2em; text-transform: uppercase;
+    cursor: pointer; transition: all .15s;
+  }
+  .hdr-btn:hover { background: var(--accent); color: #0b0d12; }
+  .hdr-btn.active {
+    background: var(--accent); color: #0b0d12;
+  }
+
+  main {
+    display: grid; grid-template-columns: 1fr 320px;
+    flex: 1 1 0; min-height: 0; overflow: hidden;
+  }
+  /* Coluna com player + controles empilhados verticalmente. */
+  .player-col {
+    display: flex; flex-direction: column;
+    min-width: 0; min-height: 0; overflow: hidden;
+  }
+  .player-wrap {
+    background: #000; display: flex; align-items: center;
+    justify-content: center; position: relative; overflow: hidden;
+    flex: 1 1 0; min-height: 0;
+  }
+  /* Double-buffer de vídeo: player-a e player-b no mesmo lugar.
+     Visibilidade via inline style (JS) pra não conflitar com outras regras. */
+  .vid {
+    position: absolute; inset: 0; margin: auto;
+    max-width: 100%; max-height: 100%;
+    object-fit: contain;
+  }
+  .no-sel {
+    color: var(--dim); font-family: var(--mono); font-size: 12px;
+    text-align: center;
+  }
+  #overlay {
+    position: absolute; pointer-events: none;
+    top: 0; left: 0;
+    display: none;
+  }
+  #overlay.on { display: block; }
+
+  /* Controles abaixo do player, sempre visíveis, sem overlap. */
+  .ctrls {
+    background: var(--panel); border-top: 1px solid var(--border);
+    padding: 10px 14px; color: var(--text);
+    font-family: var(--mono); font-size: 12px;
+    flex-shrink: 0;
+  }
+  .ctrls-seek { margin-bottom: 6px; }
+  #seek {
+    width: 100%; height: 14px;
+    -webkit-appearance: none; appearance: none;
+    background: transparent; cursor: pointer;
+  }
+  #seek::-webkit-slider-runnable-track {
+    height: 4px; background: rgba(255,255,255,.25); border-radius: 2px;
+  }
+  #seek::-moz-range-track {
+    height: 4px; background: rgba(255,255,255,.25); border-radius: 2px;
+  }
+  #seek::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); margin-top: -5px;
+    box-shadow: 0 0 4px rgba(0,229,255,.6);
+  }
+  #seek::-moz-range-thumb {
+    width: 14px; height: 14px; border-radius: 50%; border: none;
+    background: var(--accent);
+  }
+  .ctrls-row {
+    display: flex; align-items: center; gap: 4px;
+  }
+  .cbtn {
+    background: transparent; border: none; color: #fff;
+    font-size: 18px; line-height: 1; cursor: pointer;
+    padding: 6px 10px; border-radius: 4px;
+    transition: background .15s;
+  }
+  .cbtn:hover { background: rgba(255,255,255,.15); }
+  .cbtn-big { font-size: 22px; }
+  .ctime { margin-left: 8px; color: #d4d8df; white-space: nowrap; }
+  .cgrow { flex: 1; }
+  .cvol {
+    width: 80px; height: 14px; margin: 0 6px;
+    -webkit-appearance: none; appearance: none;
+    background: transparent; cursor: pointer;
+  }
+  .cvol::-webkit-slider-runnable-track {
+    height: 3px; background: rgba(255,255,255,.3); border-radius: 2px;
+  }
+  .cvol::-moz-range-track {
+    height: 3px; background: rgba(255,255,255,.3); border-radius: 2px;
+  }
+  .cvol::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #fff; margin-top: -4px;
+  }
+  .cvol::-moz-range-thumb {
+    width: 10px; height: 10px; border-radius: 50%; border: none; background: #fff;
+  }
+
+  aside {
+    background: var(--panel); border-left: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    min-height: 0; min-width: 0; overflow: hidden;
+  }
+  .aside-title {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    font-size: 11px; letter-spacing: .2em; text-transform: uppercase;
+    color: var(--dim); display: flex; justify-content: space-between;
+    flex-shrink: 0;
+  }
+  .count { color: var(--accent); font-family: var(--mono); }
+  .list { overflow-y: auto; overflow-x: hidden; flex: 1 1 0; min-height: 0; }
+  .item {
+    display: flex; gap: 10px; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); cursor: pointer;
+    transition: background .15s;
+  }
+  .item:hover { background: #161922; }
+  .item.active { background: #1c2234; border-left: 3px solid var(--accent); padding-left: 11px; }
+  .thumb {
+    width: 92px; height: 52px; background: #000; flex-shrink: 0;
+    object-fit: cover; border-radius: 2px;
+  }
+  .thumb.placeholder {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; color: var(--dim); font-family: var(--mono);
+  }
+  .meta { flex: 1; min-width: 0; }
+  .meta .when {
+    font-family: var(--mono); font-size: 12px; color: var(--text);
+    margin-bottom: 2px; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .meta .sub { font-size: 11px; color: var(--dim); font-family: var(--mono); }
+  .empty-msg {
+    padding: 20px; color: var(--dim); font-size: 12px;
+    font-family: var(--mono); text-align: center;
+  }
+
+  .quickbar {
+    border-top: 1px solid var(--border); background: var(--panel);
+    padding: 8px 10px; flex-shrink: 0;
+    display: flex; gap: 6px; overflow-x: auto; scrollbar-width: thin;
+  }
+  .qb-item {
+    width: 120px; height: 68px; flex-shrink: 0; cursor: pointer;
+    background: #000; border: 1px solid var(--border); border-radius: 3px;
+    position: relative; overflow: hidden;
+  }
+  .qb-item img { width: 100%; height: 100%; object-fit: cover; }
+  .qb-item.active { border-color: var(--accent); }
+  .qb-item .label {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    background: rgba(0,0,0,.65); color: #fff;
+    font-family: var(--mono); font-size: 9px;
+    padding: 2px 4px; text-align: center;
+  }
+  .qb-item.placeholder {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--dim); font-family: var(--mono); font-size: 10px;
+  }
+
+  @media (max-width: 720px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 1fr 260px; }
+    aside { border-left: none; border-top: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>TDL DVR — Visualizador local</h1>
+  <div class="hdr-info">
+    <span>PASTA: <span class="val" id="hdr-folder">--</span></span>
+    <span>SEGMENTS: <span class="val" id="hdr-segs">0</span></span>
+  </div>
+  <button id="pick-btn"    type="button" class="hdr-btn">ABRIR PASTA</button>
+  <input  id="pick-input"  type="file" webkitdirectory multiple hidden>
+  <button id="auto-toggle" type="button" class="hdr-btn active"
+          title="Reproduz o próximo segmento ao terminar">AUTO</button>
+  <button id="ai-toggle"   type="button" class="hdr-btn active">IA</button>
+</header>
+
+<main>
+  <div class="player-col">
+    <div class="player-wrap">
+      <div class="no-sel" id="no-sel">
+        Clique em "Abrir pasta" para selecionar o diretório com os arquivos do DVR.
+      </div>
+      <video id="player-a" class="vid" playsinline preload="auto" style="visibility:hidden"></video>
+      <video id="player-b" class="vid" playsinline preload="auto" style="visibility:hidden"></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="ctrls" id="ctrls">
+      <div class="ctrls-seek">
+        <input type="range" id="seek" min="0" max="100" step="0.01" value="0">
+      </div>
+      <div class="ctrls-row">
+        <button class="cbtn" id="btn-prev" title="Anterior">&#x23EE;</button>
+        <button class="cbtn cbtn-big" id="btn-play" title="Play/Pause">&#x25B6;</button>
+        <button class="cbtn" id="btn-next" title="Próximo">&#x23ED;</button>
+        <span class="ctime" id="ctime">0:00 / 0:00</span>
+        <span class="cgrow"></span>
+        <button class="cbtn" id="btn-mute" title="Mudo">&#x1F509;</button>
+        <input type="range" id="cvol" class="cvol" min="0" max="1" step="0.01" value="1">
+        <button class="cbtn" id="btn-fs" title="Tela cheia">&#x26F6;</button>
+      </div>
+    </div>
+  </div>
+
+  <aside>
+    <div class="aside-title">
+      <span>Gravações</span>
+      <span class="count" id="count">0</span>
+    </div>
+    <div class="list" id="list">
+      <div class="empty-msg">Nenhuma pasta aberta.</div>
+    </div>
+  </aside>
+</main>
+
+<div class="quickbar" id="quickbar"></div>
+
+<script>
+// ────────── Nome de arquivo: dvr_YYYY-MM-DD_HH-MM-SS.mp4 ──────────
+const NAME_RE = /^dvr_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.mp4$/;
+
+// Catálogo: name → {mp4: File, jpg: File|null, jsonl: File|null, mtime, label}
+let _segments = [];
+let _selected = "";
+let _folderHandle = null;
+let _aiOn = true;
+let _segDets = [];
+
+// Double-buffer: `player` sempre é o que está visível/tocando.
+// `playerNext` fica oculto pré-carregado com o próximo segmento.
+let player     = document.getElementById('player-a');
+let playerNext = document.getElementById('player-b');
+const noSel    = document.getElementById('no-sel');
+const listEl   = document.getElementById('list');
+const quickbar = document.getElementById('quickbar');
+const countEl  = document.getElementById('count');
+const segsEl   = document.getElementById('hdr-segs');
+const folderEl = document.getElementById('hdr-folder');
+const pickBtn  = document.getElementById('pick-btn');
+const aiToggle = document.getElementById('ai-toggle');
+const overlay  = document.getElementById('overlay');
+const octx     = overlay.getContext('2d');
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/(1024*1024)).toFixed(1) + ' MB';
+}
+
+// ────────── Abertura de pasta ──────────
+// Dois caminhos:
+//   A) File System Access API (showDirectoryPicker) — Chrome/Edge em
+//      localhost ou https. Bloqueado em file://.
+//   B) <input webkitdirectory> — funciona em qualquer browser moderno
+//      (inclusive file://), o usuário escolhe a pasta via diálogo nativo.
+// Tenta A primeiro; se não rolar, cai pra B automaticamente.
+async function pickFolder() {
+  if (window.showDirectoryPicker && window.isSecureContext
+      && location.protocol !== 'file:') {
+    try {
+      const handle = await window.showDirectoryPicker({ mode: 'read' });
+      folderEl.textContent = handle.name;
+      const files = [];
+      for await (const entry of handle.values()) {
+        if (entry.kind !== 'file') continue;
+        const f = await entry.getFile();
+        files.push({ name: entry.name, file: f });
+      }
+      await scanFiles(files, handle.name);
+      return;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      console.warn('showDirectoryPicker failed, falling back:', e);
+    }
+  }
+  // Fallback — dispara o input webkitdirectory
+  document.getElementById('pick-input').click();
+}
+
+document.getElementById('pick-input').addEventListener('change', async (ev) => {
+  const list = ev.target.files;
+  if (!list || !list.length) return;
+  // webkitRelativePath: "FolderName/sub/filename.mp4" — a 1ª parte é a pasta.
+  const folderName = list[0].webkitRelativePath.split('/')[0] || '(pasta)';
+  folderEl.textContent = folderName;
+  const files = [];
+  for (const f of list) {
+    // Ignora subpastas: só arquivos no nível raiz da pasta escolhida.
+    const parts = f.webkitRelativePath.split('/');
+    if (parts.length !== 2) continue;
+    files.push({ name: parts[1], file: f });
+  }
+  await scanFiles(files, folderName);
+  ev.target.value = '';  // permite re-selecionar a mesma pasta depois
+});
+
+// ────────── Auto-load via manifest.js ──────────
+// Se um <script src="manifest.js"> foi carregado antes deste bloco, a
+// variável global window.DVR_MANIFEST estará populada — renderiza direto.
+function loadFromManifest() {
+  const m = window.DVR_MANIFEST;
+  if (!m || !Array.isArray(m.segments)) return false;
+  folderEl.textContent = m.folder || '(manifest)';
+  _segments = m.segments.map(s => ({
+    name:   s.name,
+    stem:   s.name.replace(/\.mp4$/, ''),
+    label:  s.label,
+    mtime:  s.mtime,
+    size:   s.size,
+    mp4:    null,      // usa src="./name.mp4" relativo no player
+    jpg:    s.thumb ? s.thumb : null,  // string, carrega via <img src>
+    jsonl:  null,
+    _dets:  s.dets || [],  // detecções pré-parsed
+  })).sort((a, b) => b.mtime - a.mtime);
+  render();
+  return true;
+}
+
+async function scanFiles(files, folderName) {
+  _segments = [];
+  const byStem = new Map();
+  for (const { name, file } of files) {
+    const dot = name.lastIndexOf('.');
+    if (dot < 0) continue;
+    const stem = name.slice(0, dot);
+    const ext  = name.slice(dot + 1).toLowerCase();
+    if (!byStem.has(stem)) byStem.set(stem, {});
+    byStem.get(stem)[ext] = file;
+  }
+  for (const [stem, rec] of byStem) {
+    const mp4Name = stem + '.mp4';
+    const m = NAME_RE.exec(mp4Name);
+    if (!m || !rec.mp4) continue;
+    _segments.push({
+      name:  mp4Name,
+      stem:  stem,
+      label: `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`,
+      mtime: rec.mp4.lastModified,
+      size:  rec.mp4.size,
+      mp4:   rec.mp4,
+      jpg:   rec.jpg || null,
+      jsonl: rec.jsonl || null,
+    });
+  }
+  _segments.sort((a, b) => b.mtime - a.mtime);
+  render();
+}
+
+// ────────── Renderização de listas ──────────
+function render() {
+  countEl.textContent = _segments.length;
+  segsEl.textContent  = _segments.length;
+
+  if (!_segments.length) {
+    listEl.innerHTML = '<div class="empty-msg">Nenhum segmento encontrado nesta pasta.</div>';
+    quickbar.innerHTML = '<div class="qb-item placeholder">sem gravações</div>';
+    return;
+  }
+
+  listEl.innerHTML = _segments.map(s => {
+    const thumbSrc = thumbUrlFor(s);
+    const thumbHtml = thumbSrc
+      ? `<img class="thumb" src="${thumbSrc}" alt="">`
+      : `<div class="thumb placeholder">no thumb</div>`;
+    const hasAI = s.jsonl || (s._dets && s._dets.length);
+    return `
+      <div class="item${s.name === _selected ? ' active' : ''}" data-name="${s.name}">
+        ${thumbHtml}
+        <div class="meta">
+          <div class="when">${s.label}</div>
+          <div class="sub">${fmtBytes(s.size)}${hasAI ? ' · IA' : ''}</div>
+        </div>
+      </div>`;
+  }).join('');
+  for (const el of listEl.querySelectorAll('.item')) {
+    el.addEventListener('click', () => selectSegment(el.dataset.name));
+  }
+
+  quickbar.innerHTML = _segments.map(s => {
+    const thumbSrc = thumbUrlFor(s);
+    return `
+      <div class="qb-item${s.name === _selected ? ' active' : ''}" data-name="${s.name}">
+        ${thumbSrc ? `<img src="${thumbSrc}" alt="">`
+                   : `<div class="placeholder">${s.label.slice(11)}</div>`}
+        <div class="label">${s.label.slice(11)}</div>
+      </div>`;
+  }).join('');
+  for (const el of quickbar.querySelectorAll('.qb-item')) {
+    el.addEventListener('click', () => selectSegment(el.dataset.name));
+  }
+}
+
+function thumbUrlFor(s) {
+  if (!s.jpg) return '';
+  // Pode ser File (picker) ou string (manifest → caminho relativo)
+  return typeof s.jpg === 'string' ? s.jpg : URL.createObjectURL(s.jpg);
+}
+
+function srcForSegment(seg) {
+  // File (picker) → blob URL; manifest → path relativo.
+  return seg.mp4 ? URL.createObjectURL(seg.mp4) : seg.name;
+}
+
+function releaseBlob(el) {
+  if (el && el.src && el.src.startsWith('blob:')) URL.revokeObjectURL(el.src);
+}
+
+// Pré-carrega no player oculto o segmento que vem cronologicamente depois
+// do `currentName` (lista é newest-first, então "próximo" = índice - 1).
+function preloadNext(currentName) {
+  playerNext.pause();
+  releaseBlob(playerNext);
+  const idx = _segments.findIndex(s => s.name === currentName);
+  if (idx <= 0) {
+    playerNext.removeAttribute('src');
+    return;
+  }
+  const next = _segments[idx - 1];
+  playerNext.src = srcForSegment(next);
+  playerNext.load();
+}
+
+async function selectSegment(name) {
+  const seg = _segments.find(s => s.name === name);
+  if (!seg) return;
+  // Se o pré-carregado já é esse vídeo, faz swap em vez de reload.
+  const wantSrc = srcForSegment(seg);
+  const preMatches =
+      playerNext.src &&
+      (playerNext.src === wantSrc ||
+       playerNext.src.endsWith('/' + seg.name) ||
+       playerNext.src.endsWith(seg.name));
+  if (preMatches) {
+    // preloaded já contém o próximo — só troca visibilidade
+    swapToNext(name, seg);
+    // Não precisamos do wantSrc criado (criaria blob duplicado)
+    if (seg.mp4 && wantSrc.startsWith('blob:')) URL.revokeObjectURL(wantSrc);
+  } else {
+    // Load direto no ativo (primeira seleção ou seek fora da ordem)
+    releaseBlob(player);
+    player.src = wantSrc;
+    _selected = name;
+    player.play().catch(() => {});
+    highlight(name);
+    await loadDetsFor(seg);
+    if (_aiOn) renderFromVideo();
+    preloadNext(name);
+  }
+  player.style.visibility = 'visible';
+  noSel.style.display     = 'none';
+}
+
+async function loadDetsFor(seg) {
+  if (seg._dets && seg._dets.length)      _segDets = seg._dets;
+  else if (seg.jsonl)                     _segDets = await loadJsonl(seg.jsonl);
+  else                                    _segDets = [];
+}
+
+function highlight(name) {
+  for (const el of document.querySelectorAll('.item')) {
+    el.classList.toggle('active', el.dataset.name === name);
+  }
+  for (const el of document.querySelectorAll('.qb-item')) {
+    el.classList.toggle('active', el.dataset.name === name);
+  }
+}
+
+// Swap: playerNext vira visível, player vira oculto (é liberado + pré-carrega
+// o próximo-próximo). Sem flicker porque playerNext já tem frame decodificado.
+// visibility em vez de display: evita o "controls flash" que acontece quando
+// o elemento vai de fora da render tree pra dentro.
+async function swapToNext(name, seg) {
+  player.style.visibility     = 'hidden';
+  playerNext.style.visibility = 'visible';
+  const old = player;
+  player = playerNext;
+  playerNext = old;
+  playerNext.pause();
+  releaseBlob(playerNext);
+  playerNext.removeAttribute('src');
+  player.play().catch(() => {});
+  _selected = name;
+  highlight(name);
+  await loadDetsFor(seg);
+  if (_aiOn) { resizeOverlay(); renderFromVideo(); }
+  preloadNext(name);
+}
+
+async function loadJsonl(file) {
+  const out = [];
+  try {
+    const text = await file.text();
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const o = JSON.parse(line);
+        if (o.type) continue; // header, switch, etc
+        if (typeof o.t === 'number') out.push(o);
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return out;
+}
+
+// ────────── Overlay (mesma lógica do sample_dvr.py) ──────────
+const COCO17_SKELETON = [
+  [0,1],[0,2],[1,3],[2,4],[0,5],[0,6],[5,6],[5,7],[7,9],
+  [6,8],[8,10],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16],
+];
+const KP_SCORE_THR = 0.3;
+const CLS_COLORS = ["#22c55e","#3b82f6","#f59e0b","#ef4444","#a855f7",
+                    "#06b6d4","#ec4899","#84cc16","#f97316","#14b8a6"];
+function colorForClass(id) { return CLS_COLORS[Math.abs(id|0) % CLS_COLORS.length]; }
+
+function resizeOverlay() {
+  if (player.style.visibility === 'hidden' || !player.videoWidth) {
+    overlay.width = 0; overlay.height = 0; overlay._draw = null; return;
+  }
+  const hostRect = player.getBoundingClientRect();
+  const wrapRect = overlay.parentElement.getBoundingClientRect();
+  const W = Math.round(hostRect.width);
+  const H = Math.round(hostRect.height);
+  if (!W || !H) { overlay.width = 0; overlay.height = 0; overlay._draw = null; return; }
+  overlay.style.left   = (hostRect.left - wrapRect.left) + 'px';
+  overlay.style.top    = (hostRect.top  - wrapRect.top)  + 'px';
+  overlay.style.width  = W + 'px';
+  overlay.style.height = H + 'px';
+  overlay.width  = W;
+  overlay.height = H;
+  overlay._draw  = { dx: 0, dy: 0, dw: W, dh: H };
+}
+
+function drawDets(dets) {
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  if (!overlay._draw || !_aiOn) return;
+  const { dx, dy, dw, dh } = overlay._draw;
+  octx.lineWidth = 2;
+  octx.font = '12px ui-monospace, Menlo, monospace';
+  octx.textBaseline = 'top';
+
+  for (const d of dets) {
+    const color = colorForClass(d.id || 0);
+    const kps   = d.kps || [];
+    const isLine = kps.length === 2;
+
+    if (d.bb && !isLine) {
+      const [x1,y1,x2,y2] = d.bb;
+      const X = dx + x1*dw, Y = dy + y1*dh;
+      const BW = (x2-x1)*dw, BH = (y2-y1)*dh;
+      octx.strokeStyle = color;
+      octx.strokeRect(X, Y, BW, BH);
+      const label = `${d.cls} ${Math.round((d.s||0)*100)}%`;
+      const tw = octx.measureText(label).width + 8;
+      octx.fillStyle = color;
+      octx.fillRect(X, Math.max(0, Y-16), tw, 16);
+      octx.fillStyle = '#0b0d12';
+      octx.fillText(label, X+4, Math.max(0, Y-15));
+    }
+
+    if (kps.length) {
+      octx.strokeStyle = color;
+      octx.lineWidth   = isLine ? 3 : 2;
+      if (kps.length === 17) {
+        for (const [a, b] of COCO17_SKELETON) {
+          const pa = kps[a], pb = kps[b];
+          if (!pa || !pb) continue;
+          if ((pa[2]||0) < KP_SCORE_THR || (pb[2]||0) < KP_SCORE_THR) continue;
+          octx.beginPath();
+          octx.moveTo(dx + pa[0]*dw, dy + pa[1]*dh);
+          octx.lineTo(dx + pb[0]*dw, dy + pb[1]*dh);
+          octx.stroke();
+        }
+      } else if (isLine || (!d.bb && kps.length <= 8)) {
+        octx.beginPath();
+        let started = false;
+        for (const p of kps) {
+          if (!p) continue;
+          if ((p[2]||0) < KP_SCORE_THR) continue;
+          const X = dx + p[0]*dw, Y = dy + p[1]*dh;
+          if (!started) { octx.moveTo(X, Y); started = true; }
+          else           octx.lineTo(X, Y);
+        }
+        octx.stroke();
+      }
+      if (!isLine) {
+        octx.fillStyle = color;
+        for (const p of kps) {
+          if (!p) continue;
+          if ((p[2]||0) < KP_SCORE_THR) continue;
+          octx.beginPath();
+          octx.arc(dx + p[0]*dw, dy + p[1]*dh, 3, 0, Math.PI*2);
+          octx.fill();
+        }
+      }
+    }
+  }
+}
+
+function findSegDets(tMs) {
+  if (!_segDets.length) return [];
+  let lo = 0, hi = _segDets.length - 1, best = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (_segDets[mid].t <= tMs) { best = mid; lo = mid+1; }
+    else                         { hi = mid-1; }
+  }
+  const e = _segDets[best];
+  return (e && (tMs - e.t) < 500) ? (e.dets || []) : [];
+}
+
+function renderFromVideo() {
+  if (!_aiOn) return;
+  drawDets(findSegDets(player.currentTime * 1000));
+}
+
+function setOverlayVisible(on) {
+  _aiOn = on;
+  overlay.classList.toggle('on', on);
+  aiToggle.classList.toggle('active', on);
+  if (on) { resizeOverlay(); renderFromVideo(); }
+  else    { octx.clearRect(0, 0, overlay.width, overlay.height); }
+}
+
+// ────────── Listeners ──────────
+pickBtn.addEventListener('click', pickFolder);
+aiToggle.addEventListener('click', () => setOverlayVisible(!_aiOn));
+
+// ────────── Autoplay de continuidade ──────────
+// Ao terminar um segmento, pula pro próximo cronológico. A lista está
+// ordenada newest-first, então "próximo em ordem temporal" = índice - 1.
+let _autoOn = true;
+const autoToggle = document.getElementById('auto-toggle');
+autoToggle.addEventListener('click', () => {
+  _autoOn = !_autoOn;
+  autoToggle.classList.toggle('active', _autoOn);
+});
+// Anexa listeners nos DOIS <video> (double-buffer). Cada handler só age
+// quando o evento vem do elemento atualmente ativo — o outro está
+// pré-carregando em segundo plano e seus eventos devem ser ignorados.
+function attachPlayerListeners(el) {
+  el.addEventListener('ended', (e) => {
+    if (e.target !== player) return;
+    if (!_autoOn || !_selected) return;
+    const idx = _segments.findIndex(s => s.name === _selected);
+    if (idx <= 0) return;
+    const next = _segments[idx - 1];
+    setTimeout(() => {
+      const elItem = listEl.querySelector(`.item[data-name="${next.name}"]`);
+      if (elItem && elItem.scrollIntoView) elItem.scrollIntoView({block: 'nearest'});
+    }, 50);
+    selectSegment(next.name);  // swap instantâneo se preloaded
+  });
+  el.addEventListener('loadedmetadata', (e) => {
+    if (e.target !== player) return;
+    resizeOverlay();
+  });
+  el.addEventListener('timeupdate', (e) => {
+    if (e.target !== player) return;
+    if (_selected && _aiOn) renderFromVideo();
+  });
+}
+attachPlayerListeners(document.getElementById('player-a'));
+attachPlayerListeners(document.getElementById('player-b'));
+
+// rVFC roda só no ativo: o tick sempre re-bind em `player` (dinâmico)
+// — quando swap ocorre, a próxima iteração já agenda no novo ativo.
+if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+  const tick = () => {
+    if (_selected && _aiOn) renderFromVideo();
+    player.requestVideoFrameCallback(tick);
+  };
+  // Anexa em ambos pra garantir que qualquer um que se tornar ativo tenha
+  // o loop pendente. Um só dispara por frame (o ativo).
+  document.getElementById('player-a').requestVideoFrameCallback(tick);
+  document.getElementById('player-b').requestVideoFrameCallback(tick);
+}
+// Fallback timeupdate é anexado no attachPlayerListeners acima (ambos).
+window.addEventListener('resize', () => { resizeOverlay(); renderFromVideo(); });
+setOverlayVisible(true);
+
+// ─── Custom controls ───────────────────────────────────────────────────────
+const ctrls    = document.getElementById('ctrls');
+const btnPrev  = document.getElementById('btn-prev');
+const btnPlay  = document.getElementById('btn-play');
+const btnNext  = document.getElementById('btn-next');
+const btnMute  = document.getElementById('btn-mute');
+const btnFs    = document.getElementById('btn-fs');
+const seek     = document.getElementById('seek');
+const cvol     = document.getElementById('cvol');
+const ctimeEl  = document.getElementById('ctime');
+const playerWrap = document.querySelector('.player-wrap');
+
+function fmtTime(s) {
+  if (!isFinite(s)) s = 0;
+  const m = Math.floor(s / 60);
+  const ss = Math.floor(s % 60).toString().padStart(2, '0');
+  return `${m}:${ss}`;
+}
+let _seekDragging = false;
+function updateCtrls() {
+  btnPlay.innerHTML = player.paused ? '&#x25B6;' : '&#x23F8;';
+  if (isFinite(player.duration) && player.duration > 0) {
+    seek.max = player.duration;
+    if (!_seekDragging) seek.value = player.currentTime;
+    ctimeEl.textContent = `${fmtTime(player.currentTime)} / ${fmtTime(player.duration)}`;
+  } else {
+    seek.max = 0; seek.value = 0;
+    ctimeEl.textContent = fmtTime(player.currentTime);
+  }
+  const muted = player.muted || player.volume === 0;
+  btnMute.innerHTML = muted ? '&#x1F507;' : '&#x1F509;';
+  cvol.value = player.muted ? 0 : player.volume;
+}
+
+btnPlay.addEventListener('click', () => {
+  if (player.paused) player.play().catch(() => {});
+  else player.pause();
+});
+btnPrev.addEventListener('click', () => {
+  if (!_selected) return;
+  const idx = _segments.findIndex(s => s.name === _selected);
+  if (idx < 0 || idx >= _segments.length - 1) return;
+  selectSegment(_segments[idx + 1].name);
+});
+btnNext.addEventListener('click', () => {
+  if (!_selected) return;
+  const idx = _segments.findIndex(s => s.name === _selected);
+  if (idx <= 0) return;
+  selectSegment(_segments[idx - 1].name);
+});
+btnMute.addEventListener('click', () => {
+  const newMuted = !player.muted;
+  player.muted = newMuted;
+  playerNext.muted = newMuted;
+  updateCtrls();
+});
+cvol.addEventListener('input', () => {
+  const v = parseFloat(cvol.value);
+  player.volume = v;       playerNext.volume = v;
+  player.muted  = v === 0; playerNext.muted  = v === 0;
+  updateCtrls();
+});
+seek.addEventListener('input', () => {
+  _seekDragging = true;
+  player.currentTime = parseFloat(seek.value);
+});
+seek.addEventListener('change', () => { _seekDragging = false; });
+btnFs.addEventListener('click', () => {
+  if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+    (playerWrap.requestFullscreen || playerWrap.webkitRequestFullscreen)?.call(playerWrap);
+  } else {
+    (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+  }
+});
+
+// Sincroniza updateCtrls com eventos dos dois players (guardas: só o ativo).
+for (const el of [document.getElementById('player-a'),
+                  document.getElementById('player-b')]) {
+  for (const ev of ['play','pause','timeupdate','volumechange','loadedmetadata','ratechange']) {
+    el.addEventListener(ev, (e) => { if (e.target === player) updateCtrls(); });
+  }
+}
+
+// Tenta carregar direto do manifest.js (se estiver na mesma pasta dos MP4s).
+// Se não tiver manifest, usuário pode clicar "ABRIR PASTA".
+loadFromManifest();
+updateCtrls();
+</script>
+</body>
+</html>

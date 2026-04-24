@@ -74,6 +74,10 @@ class VpssPreprocessor : public BasePreprocessor {
   int      cached_dst_fmt_   = -1;
   int      cached_dst_dtype_ = -1;
   bool     cached_nearest_   = false;
+  uint32_t cached_crop_x_    = 0;
+  uint32_t cached_crop_y_    = 0;
+  uint32_t cached_crop_w_    = 0;
+  uint32_t cached_crop_h_    = 0;
   bool     vpss_params_valid_ = false;  // false → must re-apply on next frame
   bool     zero_copy_hint_   = false;  // skip copyFromImage on next call
 

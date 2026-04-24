@@ -246,9 +246,20 @@ PyRTSP::~PyRTSP() { rtsp_.reset(); }
 
 void PyRTSP::sendFrame(const PyImage& image) {
   VPSSImage* vpss = requireVPSS(image, "RTSPServer.send_frame");
+  // Flush CPU cache → DRAM so VENC DMA sees the latest pixel data.
+  // For VB-pool frames (VI/VDEC) this is a no-op; for ION CACHED frames
+  // (USB camera, RtspClient-OpenCV) it is mandatory.
+  vpss->flushCache();
   VIDEO_FRAME_INFO_S* frame = vpss->getFrame();
   if (!frame) throw std::runtime_error("RTSPServer.send_frame: null frame");
-  int ret = rtsp_->sendFrame(frame);
+  int ret;
+  {
+    // Release GIL during VENC encode + RTSP TCP write — these can block
+    // (VENC timeout 2s, live555 blocking TCP send) and would freeze
+    // the inference thread if the GIL is held.
+    py::gil_scoped_release nogil;
+    ret = rtsp_->sendFrame(frame);
+  }
   if (ret != 0) LOGE("[PyRTSP] sendFrame failed: %d\n", ret);
 }
 
@@ -520,8 +531,11 @@ void drawClassification(PyImage& image, const py::object& result) {
       const char* v = (det.contains("is_wearing_hat") &&
                        det["is_wearing_hat"].cast<bool>()) ? "Yes" : "No";
       snprintf(buf, sizeof(buf), "Hat    : %s  %.0f%%", v, score * 100.f);
+    } else if (name == "emotion" && det.contains("emotion")) {
+      std::string v = det["emotion"].cast<std::string>();
+      snprintf(buf, sizeof(buf), "Emotion: %s", v.c_str());
     } else {
-      // emotion / pose / blurness: show label + raw score
+      // pose / blurness: show label + raw score
       std::string label = name;
       label[0] = static_cast<char>(toupper(static_cast<unsigned char>(label[0])));
       snprintf(buf, sizeof(buf), "%-7s: %.2f", label.c_str(), score);
@@ -811,6 +825,320 @@ void drawOcr(PyImage& image, const py::object& result) {
               bx1 + 3, by2 - baseline - 3, scale, 235, 16, fw, fh);
   CVI_SYS_IonFlushCache(m.y_pa, m.y_va, m.y_len);
   CVI_SYS_IonFlushCache(m.uv_pa, m.uv_va, m.uv_len);
+}
+
+// ─── Draw Crop Overlay ───────────────────────────────────────────────────────
+//
+// Debug helper: draws a thumbnail of the face crop region in the bottom-right
+// corner of the frame, so the user can see exactly what the stage-2 model
+// (e.g. CLS_ATTRIBUTE) receives as input.
+//
+// face_x1..face_y2: bounding box of the detected face (pixel coords).
+// thumb_size: thumbnail width/height in pixels (default 96).
+// pad_ratio: padding around the face box (default 0.2 = 20%, matching
+//            inferenceWithDetections' kPadRatio).
+
+void drawCropOverlay(PyImage& image, float face_x1, float face_y1,
+                     float face_x2, float face_y2,
+                     int thumb_size, float pad_ratio) {
+  VPSSImage* vpss = requireVPSS(image, "draw_crop_overlay");
+  int fh = (int)vpss->getHeight(), fw = (int)vpss->getWidth();
+  auto st = vpss->getStrides();
+  int ys = (int)st[0], us = (int)st[1];
+  bool nv21 = (vpss->getImageFormat() == ImageFormat::YUV420SP_VU);
+
+  // Apply padding (same as inferenceWithDetections kPadRatio)
+  float bw = face_x2 - face_x1;
+  float bh = face_y2 - face_y1;
+  float px = bw * pad_ratio;
+  float py_ = bh * pad_ratio;  // py_ to avoid shadowing pybind11 py namespace
+
+  int cx1 = std::max(0,    (int)(face_x1 - px));
+  int cy1 = std::max(0,    (int)(face_y1 - py_));
+  int cx2 = std::min(fw-1, (int)(face_x2 + px));
+  int cy2 = std::min(fh-1, (int)(face_y2 + py_));
+
+  int cw = cx2 - cx1;
+  int ch = cy2 - cy1;
+  if (cw <= 0 || ch <= 0) return;
+
+  // Thumbnail destination in bottom-right corner (with margin + border)
+  int margin = 4;
+  int border = 2;
+  int tw = thumb_size;
+  int th = thumb_size;
+
+  // Preserve aspect ratio
+  float aspect = (float)cw / (float)ch;
+  if (aspect > 1.0f) {
+    th = (int)(tw / aspect);
+  } else {
+    tw = (int)(th * aspect);
+  }
+  if (tw < 4 || th < 4) return;
+
+  // Align to even for UV subsampling
+  tw &= ~1;
+  th &= ~1;
+
+  int dx1 = fw - margin - border - tw;
+  int dy1 = fh - margin - border - th;
+  int dx2 = dx1 + tw;
+  int dy2 = dy1 + th;
+
+  if (dx1 < 0 || dy1 < 0) return;
+
+  PlaneMapping m = mapPlanes(vpss);
+  CVI_SYS_IonInvalidateCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonInvalidateCache(m.uv_pa, m.uv_va, m.uv_len);
+
+  // Draw white border
+  static const YUVColor kWhite = YUVColor::fromRGB(255, 255, 255);
+  int bx1 = dx1 - border;
+  int by1 = dy1 - border;
+  int bx2 = dx2 + border;
+  int by2 = dy2 + border;
+  // Top border
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, bx1, by1, bx2, dy1, kWhite, fw, fh);
+  // Bottom border
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, bx1, dy2, bx2, by2, kWhite, fw, fh);
+  // Left border
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, bx1, dy1, dx1, dy2, kWhite, fw, fh);
+  // Right border
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, dx2, dy1, bx2, dy2, kWhite, fw, fh);
+
+  // Nearest-neighbor blit: crop → thumbnail.
+  // Read source into a temp buffer first to avoid source/destination
+  // aliasing: when the face bbox overlaps the thumbnail area (e.g. face
+  // detected at the bottom-right of the frame), an in-place blit would
+  // read pixels that were just overwritten by earlier iterations, producing
+  // recursive buffer garbage.
+  std::vector<uint8_t> tmp_y(static_cast<size_t>(tw) * th);
+  for (int ty = 0; ty < th; ++ty) {
+    int sy = cy1 + ty * ch / th;
+    const uint8_t* src_row = m.y_va + sy * ys;
+    uint8_t* dst_row = tmp_y.data() + ty * tw;
+    for (int tx = 0; tx < tw; ++tx) {
+      int sx = cx1 + tx * cw / tw;
+      dst_row[tx] = src_row[sx];
+    }
+  }
+  for (int ty = 0; ty < th; ++ty) {
+    std::memcpy(m.y_va + (dy1 + ty) * ys + dx1,
+                tmp_y.data() + ty * tw, tw);
+  }
+
+  // UV plane (2×2 subsampling — copy UV pairs).  Same aliasing hazard,
+  // same fix: stage through a temporary.
+  const int uv_tw = tw / 2;
+  const int uv_th = th / 2;
+  std::vector<uint8_t> tmp_uv(static_cast<size_t>(uv_tw) * uv_th * 2);
+  for (int ty = 0; ty < uv_th; ++ty) {
+    int sy_full = cy1 + (ty * 2) * ch / th;
+    int src_uv_row = (sy_full & ~1) >> 1;
+    const uint8_t* src_row = m.uv_va + src_uv_row * us;
+    uint8_t* dst_row = tmp_uv.data() + ty * (uv_tw * 2);
+    for (int tx = 0; tx < uv_tw; ++tx) {
+      int sx_full = cx1 + (tx * 2) * cw / tw;
+      int src_uv_col = sx_full & ~1;
+      dst_row[tx * 2]     = src_row[src_uv_col];
+      dst_row[tx * 2 + 1] = src_row[src_uv_col + 1];
+    }
+  }
+  for (int ty = 0; ty < uv_th; ++ty) {
+    int dst_uv_row = (dy1 >> 1) + ty;
+    std::memcpy(m.uv_va + dst_uv_row * us + (dx1 & ~1),
+                tmp_uv.data() + ty * (uv_tw * 2),
+                uv_tw * 2);
+  }
+
+  CVI_SYS_IonFlushCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonFlushCache(m.uv_pa, m.uv_va, m.uv_len);
+}
+
+// ─── Two-phase thumbnail: capture pristine crop, then commit as thumbnail ───
+//
+// Shared layout helper: compute padded crop rect + thumbnail rect, matching
+// drawCropOverlay's geometry exactly so captureFaceCrop and drawFaceThumbnail
+// agree on sizes.
+
+namespace {
+
+struct ThumbnailLayout {
+  bool  valid;
+  int   cx1, cy1, cw, ch;  // padded source crop in frame coords
+  int   tw, th;            // thumbnail dimensions (even-aligned)
+  int   dx1, dy1;          // thumbnail top-left in frame coords
+  int   fw, fh;            // frame dimensions
+};
+
+ThumbnailLayout computeThumbnailLayout(VPSSImage* vpss,
+                                       float face_x1, float face_y1,
+                                       float face_x2, float face_y2,
+                                       int thumb_size, float pad_ratio) {
+  ThumbnailLayout L{};
+  L.valid = false;
+  L.fh = (int)vpss->getHeight();
+  L.fw = (int)vpss->getWidth();
+
+  float bw = face_x2 - face_x1;
+  float bh = face_y2 - face_y1;
+  float px = bw * pad_ratio;
+  float py_ = bh * pad_ratio;
+  L.cx1 = std::max(0,      (int)(face_x1 - px));
+  L.cy1 = std::max(0,      (int)(face_y1 - py_));
+  int cx2 = std::min(L.fw - 1, (int)(face_x2 + px));
+  int cy2 = std::min(L.fh - 1, (int)(face_y2 + py_));
+  L.cw = cx2 - L.cx1;
+  L.ch = cy2 - L.cy1;
+  if (L.cw <= 0 || L.ch <= 0) return L;
+
+  int tw = thumb_size, th = thumb_size;
+  float aspect = (float)L.cw / (float)L.ch;
+  if (aspect > 1.0f) th = (int)(tw / aspect);
+  else               tw = (int)(th * aspect);
+  if (tw < 4 || th < 4) return L;
+  tw &= ~1; th &= ~1;
+  L.tw = tw; L.th = th;
+
+  const int margin = 4, border = 2;
+  L.dx1 = L.fw - margin - border - tw;
+  L.dy1 = L.fh - margin - border - th;
+  if (L.dx1 < 0 || L.dy1 < 0) return L;
+
+  L.valid = true;
+  return L;
+}
+
+}  // namespace
+
+py::dict captureFaceCrop(PyImage& image, float face_x1, float face_y1,
+                         float face_x2, float face_y2,
+                         int thumb_size, float pad_ratio) {
+  VPSSImage* vpss = requireVPSS(image, "capture_face_crop");
+  auto st = vpss->getStrides();
+  int ys = (int)st[0], us = (int)st[1];
+  bool nv21 = (vpss->getImageFormat() == ImageFormat::YUV420SP_VU);
+
+  ThumbnailLayout L = computeThumbnailLayout(vpss, face_x1, face_y1,
+                                             face_x2, face_y2,
+                                             thumb_size, pad_ratio);
+  if (!L.valid) return py::dict();
+
+  PlaneMapping m = mapPlanes(vpss);
+  CVI_SYS_IonInvalidateCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonInvalidateCache(m.uv_pa, m.uv_va, m.uv_len);
+
+  // Downsample Y plane into a linear buffer (nearest-neighbor).
+  std::vector<uint8_t> y_data(static_cast<size_t>(L.tw) * L.th);
+  for (int ty = 0; ty < L.th; ++ty) {
+    int sy = L.cy1 + ty * L.ch / L.th;
+    const uint8_t* src_row = m.y_va + sy * ys;
+    uint8_t* dst_row = y_data.data() + ty * L.tw;
+    for (int tx = 0; tx < L.tw; ++tx) {
+      int sx = L.cx1 + tx * L.cw / L.tw;
+      dst_row[tx] = src_row[sx];
+    }
+  }
+
+  // Downsample UV plane (2×2 subsampled, interleaved VU/UV).
+  const int uv_tw = L.tw / 2;
+  const int uv_th = L.th / 2;
+  std::vector<uint8_t> uv_data(static_cast<size_t>(uv_tw) * uv_th * 2);
+  for (int ty = 0; ty < uv_th; ++ty) {
+    int sy_full = L.cy1 + (ty * 2) * L.ch / L.th;
+    int src_uv_row = (sy_full & ~1) >> 1;
+    const uint8_t* src_row = m.uv_va + src_uv_row * us;
+    uint8_t* dst_row = uv_data.data() + ty * (uv_tw * 2);
+    for (int tx = 0; tx < uv_tw; ++tx) {
+      int sx_full = L.cx1 + (tx * 2) * L.cw / L.tw;
+      int src_uv_col = sx_full & ~1;
+      dst_row[tx * 2]     = src_row[src_uv_col];
+      dst_row[tx * 2 + 1] = src_row[src_uv_col + 1];
+    }
+  }
+
+  py::dict snap;
+  snap["tw"]   = L.tw;
+  snap["th"]   = L.th;
+  snap["nv21"] = nv21;
+  snap["y"]    = py::bytes(reinterpret_cast<const char*>(y_data.data()),
+                           y_data.size());
+  snap["uv"]   = py::bytes(reinterpret_cast<const char*>(uv_data.data()),
+                           uv_data.size());
+  return snap;
+}
+
+void drawFaceThumbnail(PyImage& image, const py::dict& snapshot) {
+  if (snapshot.size() == 0) return;
+  if (!snapshot.contains("tw") || !snapshot.contains("th") ||
+      !snapshot.contains("y")  || !snapshot.contains("uv")) return;
+
+  VPSSImage* vpss = requireVPSS(image, "draw_face_thumbnail");
+  int fh = (int)vpss->getHeight(), fw = (int)vpss->getWidth();
+  auto st = vpss->getStrides();
+  int ys = (int)st[0], us = (int)st[1];
+  bool nv21 = (vpss->getImageFormat() == ImageFormat::YUV420SP_VU);
+
+  int tw = snapshot["tw"].cast<int>();
+  int th = snapshot["th"].cast<int>();
+  if (tw <= 0 || th <= 0 || (tw & 1) || (th & 1)) return;
+
+  std::string y_str  = snapshot["y"].cast<std::string>();
+  std::string uv_str = snapshot["uv"].cast<std::string>();
+  const int uv_tw = tw / 2;
+  const int uv_th = th / 2;
+  if ((int)y_str.size()  != tw * th)           return;
+  if ((int)uv_str.size() != uv_tw * uv_th * 2) return;
+
+  const int margin = 4, border = 2;
+  int dx1 = fw - margin - border - tw;
+  int dy1 = fh - margin - border - th;
+  int dx2 = dx1 + tw;
+  int dy2 = dy1 + th;
+  if (dx1 < 0 || dy1 < 0) return;
+
+  PlaneMapping m = mapPlanes(vpss);
+  CVI_SYS_IonInvalidateCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonInvalidateCache(m.uv_pa, m.uv_va, m.uv_len);
+
+  static const YUVColor kWhite = YUVColor::fromRGB(255, 255, 255);
+  int bx1 = dx1 - border, by1 = dy1 - border;
+  int bx2 = dx2 + border, by2 = dy2 + border;
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, bx1, by1, bx2, dy1, kWhite, fw, fh);
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, bx1, dy2, bx2, by2, kWhite, fw, fh);
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, bx1, dy1, dx1, dy2, kWhite, fw, fh);
+  yuvFillRect(m.y_va, m.uv_va, ys, us, nv21, dx2, dy1, bx2, dy2, kWhite, fw, fh);
+
+  const uint8_t* y_src  = reinterpret_cast<const uint8_t*>(y_str.data());
+  const uint8_t* uv_src = reinterpret_cast<const uint8_t*>(uv_str.data());
+
+  for (int ty = 0; ty < th; ++ty) {
+    std::memcpy(m.y_va + (dy1 + ty) * ys + dx1,
+                y_src + ty * tw, tw);
+  }
+  for (int ty = 0; ty < uv_th; ++ty) {
+    int dst_uv_row = (dy1 >> 1) + ty;
+    std::memcpy(m.uv_va + dst_uv_row * us + (dx1 & ~1),
+                uv_src + ty * (uv_tw * 2),
+                uv_tw * 2);
+  }
+
+  CVI_SYS_IonFlushCache(m.y_pa, m.y_va, m.y_len);
+  CVI_SYS_IonFlushCache(m.uv_pa, m.uv_va, m.uv_len);
+}
+
+py::tuple getThumbnailRect(PyImage& image, int thumb_size) {
+  VPSSImage* vpss = requireVPSS(image, "get_thumbnail_rect");
+  int fh = (int)vpss->getHeight(), fw = (int)vpss->getWidth();
+  const int margin = 4, border = 2;
+  int x2 = fw - margin;
+  int y2 = fh - margin;
+  int x1 = x2 - 2 * border - thumb_size;
+  int y1 = y2 - 2 * border - thumb_size;
+  if (x1 < 0) x1 = 0;
+  if (y1 < 0) y1 = 0;
+  return py::make_tuple(x1, y1, x2, y2);
 }
 
 // ─── JPEG export ─────────────────────────────────────────────────────────────

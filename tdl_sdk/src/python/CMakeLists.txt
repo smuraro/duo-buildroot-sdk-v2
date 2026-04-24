@@ -77,14 +77,17 @@ file(GLOB_RECURSE SRC_FRAMWORK_FILES_CUR ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 if ("${CVI_PLATFORM}" STREQUAL "CV181X" OR "${CVI_PLATFORM}" STREQUAL "CV184X")
     if (NOT HAVE_OPENCV_VIDEOIO)
         list(FILTER SRC_FRAMWORK_FILES_CUR EXCLUDE REGEX "/py_rtsp_client\\.cpp$")
-        message(STATUS "py_rtsp_client.cpp excluded (no OpenCV videoio)")
+        list(FILTER SRC_FRAMWORK_FILES_CUR EXCLUDE REGEX "/py_usb_camera\\.cpp$")
+        message(STATUS "py_rtsp_client.cpp and py_usb_camera.cpp excluded (no OpenCV videoio)")
     endif()
 endif()
 
-# Include rtsp.cpp and image_encoder.cpp directly so py_rtsp.cpp can link against them
+# Include rtsp.cpp, video_recorder.cpp and image_encoder.cpp directly so the
+# py_rtsp / py_video_recorder wrappers can link against them.
 if ("${CVI_PLATFORM}" STREQUAL "CV181X" OR "${CVI_PLATFORM}" STREQUAL "CV184X")
     list(APPEND SRC_FRAMWORK_FILES_CUR
         ${REPO_DIR}/src/components/encoder/rtsp/rtsp.cpp
+        ${REPO_DIR}/src/components/encoder/video_recorder/video_recorder.cpp
         ${REPO_DIR}/src/components/encoder/image_encoder/image_encoder.cpp)
 endif()
 
@@ -116,6 +119,11 @@ if ("${CVI_PLATFORM}" STREQUAL "CV181X" OR "${CVI_PLATFORM}" STREQUAL "CV184X")
         "-Wl,--end-group"
         # VDEC hardware decoder (used by RtspClientVdec)
         ${MIDDLEWARE_SDK_ROOT}/lib/libvdec.so
+        # libavformat / libavcodec / libavutil (MP4 muxing in VideoRecorder).
+        # Shipped with the TPU SDK next to libvdec.
+        ${MLIR_SDK_ROOT}/lib/libavformat.so
+        ${MLIR_SDK_ROOT}/lib/libavcodec.so
+        ${MLIR_SDK_ROOT}/lib/libavutil.so
     )
     if (HAVE_OPENCV_VIDEOIO)
         target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_OPENCV_VIDEOIO=1)
