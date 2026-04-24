@@ -1,0 +1,44 @@
+#!/bin/sh
+# Umount limpo do SD antes de remover fisicamente.
+# Uso: sd-eject
+# Evita corrupção + journal abort do ext4 em remoção abrupta.
+
+MOUNTPOINT=/mnt/sd
+
+# GUARD: se /mnt/sd NÃO é um mount point, não tem nada pra ejetar.
+# Sem esse guard, `fuser -m` cairia na partição pai (rootfs) e devolveria
+# PID 1 (init); o kill subsequente reboota o device. Evita esse acidente.
+if ! mountpoint -q "$MOUNTPOINT"; then
+    echo "sd-eject: $MOUNTPOINT não está montado — nada a fazer."
+    exit 0
+fi
+
+# Para qualquer processo usando o SD (sample_dvr.py costuma ser o único).
+# Usa fuser -M pra obrigar que a comparação seja por DEVICE DO MOUNT
+# específico; não cai na partição pai se o mount sumir no meio.
+PIDS=$(fuser -M -m "$MOUNTPOINT" 2>/dev/null | tr ',' ' ')
+for pid in $PIDS; do
+    [ -z "$pid" ] && continue
+    # SAFETY: nunca mandar SIGTERM pra PID 1 (init).
+    if [ "$pid" -eq 1 ]; then
+        echo "sd-eject: IGNORANDO PID 1 (init) — algo muito errado" >&2
+        continue
+    fi
+    echo "sd-eject: encerrando PID $pid que usa $MOUNTPOINT"
+    kill -TERM "$pid" 2>/dev/null
+done
+
+# Aguarda 2s pros processos fecharem arquivos
+sleep 2
+
+sync
+umount "$MOUNTPOINT" 2>&1 && {
+    echo "sd-eject: $MOUNTPOINT desmontado. Seguro remover o cartão."
+    exit 0
+}
+
+echo "sd-eject: umount falhou. Tentando lazy umount..." >&2
+umount -l "$MOUNTPOINT" 2>&1
+sync
+echo "sd-eject: OK (lazy). Aguarde ~2s antes de remover." >&2
+sleep 2
