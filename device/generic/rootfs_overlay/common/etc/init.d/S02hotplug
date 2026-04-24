@@ -1,0 +1,18 @@
+#!/bin/sh
+# Habilita mdev como handler de uevents de hotplug do kernel.
+# Sem isso, inserir/remover SD/USB/etc não dispara nenhuma ação
+# automatica (ver /etc/mdev.conf para as regras).
+#
+# S02 pra rodar antes do S40mountsd — assim quando o S40 roda o mount
+# inicial, os nodes /dev/mmcblk* já estão populados via `mdev -s`.
+
+case "$1" in
+  start)
+    echo /sbin/mdev > /proc/sys/kernel/hotplug
+    # Popula /dev baseado no estado atual do sysfs (devices já presentes).
+    /sbin/mdev -s
+    ;;
+  stop)
+    : # nada a fazer — mdev é stateless
+    ;;
+esac

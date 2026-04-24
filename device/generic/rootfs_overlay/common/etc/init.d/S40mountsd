@@ -1,0 +1,76 @@
+#!/bin/sh
+# Monta SD em /mnt/sd no boot. Detecta o fs via blkid (ntfs/vfat/exfat/extN).
+# ntfs -> chama ntfs-3g direto (busybox mount nem sempre invoca mount.<fstype>).
+#
+# Também é invocado pelo mdev em hotplug do SD com $ACTION = add|remove
+# (ver /etc/mdev.conf). Aliases: add→start, remove→stop.
+
+MOUNTPOINT=/mnt/sd
+DEVICE=/dev/mmcblk1p1
+
+# Normaliza o comando recebido do mdev pra start/stop.
+case "$1" in
+  add)    set -- start ;;
+  remove) set -- stop  ;;
+esac
+
+case "$1" in
+  start)
+    # Espera até 10s pelo device (mmc registra async ~4s após boot).
+    i=0
+    while [ ! -b "$DEVICE" ] && [ $i -lt 20 ]; do
+      sleep 0.5
+      i=$((i+1))
+    done
+    [ -b "$DEVICE" ] || exit 0
+    mkdir -p "$MOUNTPOINT"
+    FSTYPE=$(blkid -o value -s TYPE "$DEVICE" 2>/dev/null)
+    case "$FSTYPE" in
+      ntfs)            ntfs-3g -o big_writes "$DEVICE" "$MOUNTPOINT" ;;
+      vfat)            mount -t vfat  -o rw,noatime "$DEVICE" "$MOUNTPOINT" ;;
+      exfat)           mount -t exfat -o rw,noatime "$DEVICE" "$MOUNTPOINT" ;;
+      # ext4: commit=5 força sync do journal a cada 5s (em vez do default 30s)
+      # — menos dados em risco numa queda de energia. noatime + nodiratime
+      # elimina writes de "acesso" que só custam I/O sem utilidade pra DVR.
+      ext4)            mount -t ext4 -o noatime,nodiratime,commit=5 "$DEVICE" "$MOUNTPOINT" ;;
+      ext3|ext2)       mount -t "$FSTYPE" -o noatime,nodiratime "$DEVICE" "$MOUNTPOINT" ;;
+      *)               echo "S40mountsd: unsupported/empty fs on $DEVICE ($FSTYPE)" >&2 ;;
+    esac
+    ;;
+  stop)
+    # Chamado pelo mdev "remove" quando o SD é puxado (mesmo sem sd-eject
+    # prévio), OU manualmente. Hotplug do CV181X tem bug: kobjects/debugfs
+    # de mmcblk1 não são liberados, impedindo reinserção até reboot.
+    # Mitigação: força cleanup via sysfs aqui.
+    sync
+    umount "$MOUNTPOINT" 2>/dev/null
+    umount -l "$MOUNTPOINT" 2>/dev/null
+
+    # Mata processos que ainda podem estar segurando o mountpoint —
+    # cuidadosamente, NUNCA PID 1. Só disparamos isso em stop explícito,
+    # não no boot (fuser num mountpoint não-existente é seguro aqui porque
+    # já umountamos acima).
+    if mountpoint -q "$MOUNTPOINT"; then
+      for pid in $(fuser -M -m "$MOUNTPOINT" 2>/dev/null | tr ',' ' '); do
+        [ -z "$pid" ] && continue
+        [ "$pid" -eq 1 ] && continue
+        kill -TERM "$pid" 2>/dev/null
+      done
+      sleep 1
+      umount -l "$MOUNTPOINT" 2>/dev/null
+    fi
+
+    # Força delete do block device no sysfs pra garantir que kobjects e
+    # debugfs do mmcblk1 são liberados. Sem isso, reinserção falha com
+    # -EEXIST. Os dois paths abaixo cobrem kernels que colocam o "delete"
+    # em lugares diferentes.
+    for p in /sys/block/mmcblk1/device/delete \
+             /sys/class/block/mmcblk1/device/delete; do
+      [ -w "$p" ] && echo 1 > "$p" 2>/dev/null && break
+    done
+    ;;
+  restart|reload)
+    "$0" stop
+    "$0" start
+    ;;
+esac
