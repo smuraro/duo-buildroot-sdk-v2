@@ -64,6 +64,8 @@ modules.order
 /Module.markers
 /modules.builtin.modinfo
 /modules.nsdeps
+/modules/
+/riscv/
 
 #
 # RPM spec file (make rpm-pkg)
