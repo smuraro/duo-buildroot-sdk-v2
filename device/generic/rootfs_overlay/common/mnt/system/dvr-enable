@@ -1,0 +1,64 @@
+#!/bin/sh
+# Habilita o auto-start do DVR (sample_dvr.py via auto.sh) no boot
+# e inicia agora. No-op se já estiver em execução.
+# Estado persiste em /mnt/data/dvr_enabled e sobrevive reboots.
+
+FLAG=/mnt/data/dvr_enabled
+AUTO=/mnt/system/auto.sh
+LOCKDIR=/tmp/dvr-enable.lock
+
+# Detecta auto.sh ou sample_dvr.py em /proc/*/cmdline. Usamos /proc direto
+# em vez de pgrep porque o pgrep do busybox neste SDK não estava casando
+# o padrão (versão/regex divergente — duas execuções rápidas subiam duas
+# instâncias). Cobre também a janela de até 30s em que auto.sh espera o SD
+# montar antes de exec'ar python — nessa fase só existe `sh auto.sh`.
+dvr_running() {
+    for f in /proc/[0-9]*/cmdline; do
+        [ -r "$f" ] || continue
+        cmd=$(tr '\0' ' ' < "$f" 2>/dev/null)
+        case "$cmd" in
+            *sample_dvr.py*|*/mnt/system/auto.sh*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+if dvr_running; then
+    echo "[dvr-enable] ja em execucao - nada a fazer."
+    exit 0
+fi
+
+# Lock atômico contra invocações concorrentes (mkdir é atômico no Linux).
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    echo "[dvr-enable] outro dvr-enable em curso - saindo."
+    exit 0
+fi
+trap 'rm -rf "$LOCKDIR"' EXIT INT TERM
+
+# Re-check após pegar o lock (fecha TOCTOU com outro dvr-enable que já
+# tinha passado pelo dvr_running mas ainda não tinha spawnado).
+if dvr_running; then
+    echo "[dvr-enable] subiu enquanto eu esperava - saindo."
+    exit 0
+fi
+
+if [ ! -d /mnt/data ]; then
+    echo "[dvr-enable] /mnt/data nao existe - userdata nao montado?" >&2
+    exit 1
+fi
+
+touch "$FLAG" || { echo "[dvr-enable] falhou ao criar $FLAG" >&2; exit 1; }
+echo "[dvr-enable] auto-start HABILITADO ($FLAG)"
+
+if [ ! -f "$AUTO" ]; then
+    echo "[dvr-enable] $AUTO nao encontrado; so atualizei o flag." >&2
+    exit 0
+fi
+
+echo "[dvr-enable] iniciando agora em background..."
+setsid sh "$AUTO" </dev/null >/dev/null 2>&1 &
+echo "[dvr-enable] PID do launcher: $!"
+
+# Segura o lock por 2s para que um dvr-enable disparado em sequência
+# enxergue o novo auto.sh em /proc antes de tentar spawnar.
+sleep 2

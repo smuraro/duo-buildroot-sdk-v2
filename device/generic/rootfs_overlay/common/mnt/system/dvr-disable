@@ -1,0 +1,58 @@
+#!/bin/sh
+# Desabilita o auto-start do DVR no boot e para a instância atual se rodando.
+# Estado persiste (ausência de /mnt/data/dvr_enabled) e sobrevive reboots.
+
+FLAG=/mnt/data/dvr_enabled
+
+# Lista PIDs cujo cmdline em /proc casa auto.sh ou sample_dvr.py.
+# Usamos /proc direto em vez de pgrep/pkill -f porque o busybox deste SDK
+# não estava casando o padrão (versão/regex divergente).
+dvr_pids() {
+    for f in /proc/[0-9]*/cmdline; do
+        [ -r "$f" ] || continue
+        cmd=$(tr '\0' ' ' < "$f" 2>/dev/null)
+        case "$cmd" in
+            *sample_dvr.py*|*/mnt/system/auto.sh*)
+                pid=${f#/proc/}
+                pid=${pid%/cmdline}
+                echo "$pid"
+                ;;
+        esac
+    done
+}
+
+rm -f "$FLAG"
+echo "[dvr-disable] auto-start DESABILITADO (removido $FLAG)"
+
+pids=$(dvr_pids)
+if [ -z "$pids" ]; then
+    echo "[dvr-disable] nao esta em execucao - nada a parar."
+    exit 0
+fi
+
+echo "[dvr-disable] enviando SIGTERM para PIDs: $pids"
+for p in $pids; do
+    kill -TERM "$p" 2>/dev/null
+done
+
+# Aguarda graceful shutdown (DVR fecha segmento mp4 atual ao sair).
+i=0
+while [ -n "$(dvr_pids)" ] && [ $i -lt 10 ]; do
+    sleep 1
+    i=$((i+1))
+done
+
+remaining=$(dvr_pids)
+if [ -n "$remaining" ]; then
+    echo "[dvr-disable] nao terminou em 10s - forcando SIGKILL em: $remaining" >&2
+    for p in $remaining; do
+        kill -KILL "$p" 2>/dev/null
+    done
+    sleep 1
+fi
+
+if [ -n "$(dvr_pids)" ]; then
+    echo "[dvr-disable] FALHOU - processo ainda vivo." >&2
+    exit 1
+fi
+echo "[dvr-disable] parado."
