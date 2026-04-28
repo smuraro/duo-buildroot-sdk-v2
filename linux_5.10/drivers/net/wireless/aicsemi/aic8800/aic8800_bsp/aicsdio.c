@@ -1429,7 +1429,7 @@ static void aicwf_sdio_bus_pwrctl(ulong data)
 	struct aic_sdio_dev *sdiodev = (struct aic_sdio_dev *) data;
 #endif
 	if (sdiodev->bus_if->state == BUS_DOWN_ST) {
-		sdio_err("bus down\n");
+		sdio_dbg("bus down\n");
 		return;
 	}
 
