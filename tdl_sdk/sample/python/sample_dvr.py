@@ -81,7 +81,11 @@ _shutdown_watchdog_started = False
 def _shutdown_watchdog(timeout_s: float = 5.0):
     """Hard-exit se o shutdown gracioso não terminar em N segundos.
     Necessário porque rec.close()/cam.close() são C++ blocking: o handler
-    Python do segundo SIGINT não roda até eles retornarem."""
+    Python do segundo SIGINT não roda até eles retornarem.
+
+    OBS: se o driver de vídeo deixou o processo em estado D (uninterruptible),
+    nem os._exit/SIGKILL matam — só reboot. A defesa nesse caso é evitar
+    entrar nesse estado (ver _safe_shutdown_recorder)."""
     time.sleep(timeout_s)
     print(f"\n[dvr] shutdown timeout ({timeout_s}s) — forçando exit.",
           flush=True)
@@ -176,9 +180,13 @@ def record_loop(args):
     global _running, _latest_jpeg
 
     print(f"\nAbrindo câmera VI {args.width}x{args.height} @ {args.fps} fps ...")
+    # vb_buffer_num=5: dá folga na FIFO VI→VPSS quando o record_loop
+    # sofre jitter (inferência, flush de SD, web threads). Evita erros
+    # "CSIBDG fifo overflow" em rajadas temporárias. Custo: ~5 buffers
+    # a mais ocupados (cada ~1.4MB @ 1280x720 NV21 = ~7MB extra).
     cam = image.Camera(args.width, args.height,
                        image.ImageFormat.YUV420SP_VU,
-                       vb_buffer_num=3,
+                       vb_buffer_num=5,
                        mirror=args.mirror, flip=args.flip)
 
     print(f"Iniciando recorder {args.codec.upper()} "
@@ -201,6 +209,13 @@ def record_loop(args):
     # Track da rotação de segmento pra atualizar o manifest.js (consumido
     # pelo dvr_viewer.html offline).
     last_segment  = ""
+    # Setado pelo handler de erro do send_frame — se True, o destrutor do
+    # VENC trava no driver. Pulamos rec.close() nesse caso.
+    _recorder_broken = False
+    # [PROFILE] acumuladores zerados a cada report (5s)
+    _prof_n = 0
+    _prof_read = _prof_send = _prof_ai = _prof_jpeg = 0.0
+    _prof_ai_count = _prof_jpeg_cnt = 0
 
     try:
         while _running:
@@ -267,32 +282,67 @@ def record_loop(args):
 
             engine_snapshot = _engine
 
+            # === [PROFILE] timing breakdown ===========================
+            _t0 = time.time()
             frame = cam.read()
+            _t_read = time.time() - _t0
+
+            _t_send = _t_ai = _t_jpeg = 0.0
             try:
-                rec.send_frame(frame)
-                if (have_slack and _live_watchers > 0
-                        and (now - last_jpeg_time) >= jpeg_period):
-                    jpeg = image.frame_to_jpeg(
-                        frame,
-                        quality=args.live_jpeg_quality,
-                        scale=args.live_scale)
-                    with _jpeg_lock:
-                        _latest_jpeg = jpeg
-                    last_jpeg_time = now
-                # Inferência oportunística: só roda se o loop está em dia.
-                # Gravação sempre tem prioridade.
-                if engine_snapshot is not None and have_slack:
+                # Prioridade 1 — gravação (sempre).
+                _t1 = time.time()
+                try:
+                    rec.send_frame(frame)
+                except Exception as e:
+                    # VENC retornou erro (tipicamente ERR_VENC_BUSY 0xC0078012).
+                    # Estado interno do encoder está corrompido — chamar
+                    # rec.close() aqui levaria o driver pra D-state. Marcamos
+                    # broken pra finally pular o close.
+                    print(f"[dvr] recorder erro fatal: {e}", flush=True)
+                    _recorder_broken = True
+                    raise
+                _t_send = time.time() - _t1
+                # Prioridade 2 — inferência IA. Roda em TODO frame (sem gate
+                # de slack) pra garantir que o JSONL do segmento fica denso
+                # mesmo durante live mode. Tradeoff: se infer() for pesado, o
+                # FPS-alvo pode cair — aceito porque IA > live na hierarquia.
+                if engine_snapshot is not None:
                     current = rec.current_segment()
                     if current:
                         engine_snapshot.open_segment(current, args.out_dir)
                         seg_start = rec.segment_start_ms()
                         t_ms = int(time.time() * 1000) - seg_start \
                                if seg_start else 0
+                        _t2 = time.time()
                         engine_snapshot.infer(frame, t_ms,
                                               args.width, args.height)
+                        _t_ai = time.time() - _t2
                         _publish_detections()
+                # Prioridade 3 — JPEG live. Re-checa slack APÓS a IA: só
+                # encoda se o loop continua adiantado em relação ao tick.
+                # Assim o JPEG cede CPU pra IA quando há aperto.
+                if (_live_watchers > 0
+                        and (now - last_jpeg_time) >= jpeg_period
+                        and (next_tick - time.time()) > 0):
+                    _t3 = time.time()
+                    jpeg = image.frame_to_jpeg(
+                        frame,
+                        quality=args.live_jpeg_quality,
+                        scale=args.live_scale)
+                    _t_jpeg = time.time() - _t3
+                    with _jpeg_lock:
+                        _latest_jpeg = jpeg
+                    last_jpeg_time = now
             finally:
                 cam.release()
+            # Acumula pra report periódico
+            _prof_n    += 1
+            _prof_read += _t_read
+            _prof_send += _t_send
+            _prof_ai   += _t_ai
+            _prof_jpeg += _t_jpeg
+            if _t_ai > 0:   _prof_ai_count += 1
+            if _t_jpeg > 0: _prof_jpeg_cnt += 1
 
             frame_idx += 1
             now = time.time()
@@ -315,6 +365,24 @@ def record_loop(args):
             if now - t_report >= 5.0:
                 print(f"  frame {frame_idx:6d}  fps={fps_avg:4.1f}  "
                       f"segment={current_seg or '(waiting keyframe)'}")
+                # === [PROFILE] médias do intervalo (em ms por frame) =====
+                if _prof_n > 0:
+                    n = _prof_n
+                    avg_read = 1000.0 * _prof_read / n
+                    avg_send = 1000.0 * _prof_send / n
+                    avg_ai   = (1000.0 * _prof_ai / _prof_ai_count) \
+                                if _prof_ai_count else 0.0
+                    avg_jpeg = (1000.0 * _prof_jpeg / _prof_jpeg_cnt) \
+                                if _prof_jpeg_cnt else 0.0
+                    print(f"  [prof] frames={n}  "
+                          f"read={avg_read:5.1f}ms  "
+                          f"send={avg_send:5.1f}ms  "
+                          f"ai={avg_ai:5.1f}ms x{_prof_ai_count}  "
+                          f"jpeg={avg_jpeg:5.1f}ms x{_prof_jpeg_cnt}  "
+                          f"watchers={_live_watchers}",
+                          flush=True)
+                _prof_n = _prof_read = _prof_send = _prof_ai = _prof_jpeg = 0
+                _prof_ai_count = _prof_jpeg_cnt = 0
                 t_report = now
 
     except Exception as exc:
@@ -328,13 +396,23 @@ def record_loop(args):
         # Acorda SSE subscribers cedo pra não segurar threads.
         with _sse_cond:
             _sse_cond.notify_all()
+
+        # _recorder_broken: send_frame retornou erro fatal (tipicamente
+        # CVI_ERR_VENC_BUSY 0xC0078012). Chamar rec.close() nesse caso
+        # levaria o driver pra D-state (uninterruptible) — só reboot
+        # recupera. Pulamos o close e deixamos o kernel limpar o FD no
+        # exit do processo (que pode ou não conseguir limpar o VENC).
         if rec is not None:
-            print("[dvr] fechando recorder...", flush=True)
-            try:
-                rec.close()
-            except Exception as e:
-                print(f"[dvr] rec.close exception: {e}", flush=True)
-            print("[dvr] recorder fechado.", flush=True)
+            if _recorder_broken:
+                print("[dvr] recorder em estado ruim — pulando close pra "
+                      "evitar D-state.", flush=True)
+            else:
+                print("[dvr] fechando recorder...", flush=True)
+                try:
+                    rec.close()
+                except Exception as e:
+                    print(f"[dvr] rec.close exception: {e}", flush=True)
+                print("[dvr] recorder fechado.", flush=True)
         print("[dvr] fechando câmera...", flush=True)
         try:
             cam.close()
@@ -399,44 +477,23 @@ def _scan_segments(out_dir):
 _manifest_lock = threading.Lock()
 
 def _write_manifest(out_dir):
-    """Gera manifest.js no out_dir com a lista de segmentos fechados +
-    detecções embutidas do .jsonl. Serve para o dvr_viewer.html abrir a
-    pasta via file:// sem precisar de servidor HTTP (o <script src>
-    autopopula quando o HTML é aberto dentro da mesma pasta).
+    """Gera manifest.js no out_dir com a lista de segmentos fechados
+    (apenas metadata: name/thumb/size/mtime/label). Detecções por segmento
+    são carregadas on-demand pelo viewer via /files/<stem>.jsonl quando o
+    usuário clica num segmento, evitando inflar o manifest.
     Executa sob lock pra evitar entrelaçar rebuilds concorrentes."""
     if not _manifest_lock.acquire(blocking=False):
         # Já tem outra thread reescrevendo — skip, ela cobre o estado atual.
         return
     try:
         segs = _scan_segments(out_dir)
-        # Exclui o segmento em gravação (mesma lógica do listing)
-        out = []
-        for s in segs:
-            stem = s["name"][:-4]
-            jsonl_path = os.path.join(out_dir, stem + ".jsonl")
-            dets_entries = []
-            try:
-                with open(jsonl_path) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            o = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if isinstance(o, dict) and "t" in o:
-                            dets_entries.append(o)
-            except OSError:
-                pass
-            out.append({
-                "name":  s["name"],
-                "thumb": s["thumbnail"] or "",
-                "size":  s["size"],
-                "mtime": s["mtime"],
-                "label": s["label"],
-                "dets":  dets_entries,
-            })
+        out = [{
+            "name":  s["name"],
+            "thumb": s["thumbnail"] or "",
+            "size":  s["size"],
+            "mtime": s["mtime"],
+            "label": s["label"],
+        } for s in segs]
         payload = {
             "folder":       os.path.basename(out_dir.rstrip("/")) or "dvr",
             "generated_at": int(time.time() * 1000),
@@ -643,7 +700,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   main {
-    display: grid; grid-template-columns: 1fr 320px;
+    display: grid; grid-template-columns: 1fr;
     flex: 1 1 0; min-height: 0; overflow: hidden;
   }
   .player-wrap {
@@ -725,57 +782,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     text-align: center;
   }
 
-  aside {
-    background: var(--panel); border-left: 1px solid var(--border);
-    display: flex; flex-direction: column;
-    min-height: 0; min-width: 0; overflow: hidden;
-  }
-  .aside-title {
-    padding: 12px 16px; border-bottom: 1px solid var(--border);
-    font-size: 11px; letter-spacing: .2em; text-transform: uppercase;
-    color: var(--dim); display: flex; justify-content: space-between;
-    flex-shrink: 0;
-  }
-  .count { color: var(--accent); font-family: var(--mono); }
-  #clear-all {
-    background: transparent; color: var(--dim);
-    border: 1px solid var(--border); border-radius: 3px;
-    padding: 2px 8px; font: inherit; font-size: 10px;
-    letter-spacing: .15em; text-transform: uppercase;
-    cursor: pointer; transition: all .15s;
-  }
-  #clear-all:hover:not(:disabled) {
-    color: #ff6b6b; border-color: #ff6b6b;
-  }
+  #clear-all:hover:not(:disabled) { color: #ff6b6b; border-color: #ff6b6b; }
   #clear-all:disabled { opacity: .4; cursor: not-allowed; }
-  /* min-height:0 is required so flex:1 children can shrink below their
-     intrinsic content size and actually start scrolling. Without it a long
-     list forces the aside to grow and the scrollbar never appears. */
-  .list { overflow-y: auto; overflow-x: hidden; flex: 1 1 0; min-height: 0; }
-  .item {
-    display: flex; gap: 10px; padding: 10px 14px;
-    border-bottom: 1px solid var(--border); cursor: pointer;
-    transition: background .15s;
-  }
-  .item:hover { background: #161922; }
-  .item.active { background: #1c2234; border-left: 3px solid var(--accent); padding-left: 11px; }
-  .thumb {
-    width: 92px; height: 52px; background: #000; flex-shrink: 0;
-    object-fit: cover; border-radius: 2px;
-  }
-  .thumb.placeholder {
-    display: flex; align-items: center; justify-content: center;
-    font-size: 10px; color: var(--dim); font-family: var(--mono);
-  }
-  .meta { flex: 1; min-width: 0; }
-  .meta .when {
-    font-family: var(--mono); font-size: 12px; color: var(--text);
-    margin-bottom: 2px; white-space: nowrap; overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .meta .sub {
-    font-size: 11px; color: var(--dim); font-family: var(--mono);
-  }
 
   /* Barra de thumbnails (acesso rápido) na base */
   .quickbar {
@@ -803,14 +811,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: var(--mono); font-size: 10px; color: var(--dim);
   }
 
-  .empty-msg {
-    padding: 30px 16px; color: var(--dim); font-size: 12px;
-    text-align: center;
-  }
-
-  @media (max-width: 720px) {
-    main { grid-template-columns: 1fr; grid-template-rows: 1fr 260px; }
-    aside { border-left: none; border-top: 1px solid var(--border); }
+  .quickbar-empty {
+    padding: 22px 16px; color: var(--dim); font-size: 12px;
+    text-align: center; font-family: var(--mono);
   }
 </style>
 </head>
@@ -833,13 +836,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button id="ai-toggle"   type="button" class="hdr-btn" title="Mostrar overlay de IA">IA</button>
   <button id="rec-btn"     type="button" class="hdr-btn">PAUSAR</button>
   <button id="live-btn"    type="button" class="hdr-btn">AO VIVO</button>
+  <button id="clear-all"   type="button" class="hdr-btn"
+          title="Apagar todas as gravações do SD">LIMPAR</button>
 </header>
 
 <main>
   <div class="player-col">
     <div class="player-wrap">
       <div class="no-sel" id="no-sel">
-        Selecione um segmento à direita ou na barra abaixo.
+        Selecione um segmento na barra abaixo.
       </div>
       <video id="player-a" class="vid" playsinline preload="auto" style="visibility:hidden"></video>
       <video id="player-b" class="vid" playsinline preload="auto" style="visibility:hidden"></video>
@@ -863,18 +868,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <aside>
-    <div class="aside-title">
-      <span>Gravações</span>
-      <span style="display:flex; align-items:center; gap:10px;">
-        <button id="clear-all" type="button" title="Apagar todas as gravações">Limpar</button>
-        <span class="count" id="count">0</span>
-      </span>
-    </div>
-    <div class="list" id="list">
-      <div class="empty-msg">Nenhum segmento ainda.</div>
-    </div>
-  </aside>
 </main>
 
 <div class="quickbar" id="quickbar"></div>
@@ -890,7 +883,6 @@ let _items    = [];     // última lista do /api/list (ordenada newest→oldest)
 let player     = document.getElementById('player-a');
 let playerNext = document.getElementById('player-b');
 const noSel    = document.getElementById('no-sel');
-const listEl   = document.getElementById('list');
 const quickbar = document.getElementById('quickbar');
 const liveImg  = document.getElementById('live-img');
 const liveBtn  = document.getElementById('live-btn');
@@ -966,8 +958,9 @@ function attachPlayerListeners(el) {
     if (idx <= 0) return;
     const next = _items[idx - 1];
     setTimeout(() => {
-      const elItem = listEl.querySelector(`.item[data-name="${next.name}"]`);
-      if (elItem && elItem.scrollIntoView) elItem.scrollIntoView({block: 'nearest'});
+      const elItem = quickbar.querySelector(`.qb-item[data-name="${next.name}"]`);
+      if (elItem && elItem.scrollIntoView)
+        elItem.scrollIntoView({block: 'nearest', inline: 'center'});
     }, 50);
     selectSegment(next.name);
   });
@@ -992,9 +985,6 @@ function fmtBytes(n) {
 function srcUrl(name) { return '/files/' + encodeURIComponent(name); }
 
 function highlight(name) {
-  for (const el of document.querySelectorAll('.item')) {
-    el.classList.toggle('active', el.dataset.name === name);
-  }
   for (const el of document.querySelectorAll('.qb-item')) {
     el.classList.toggle('active', el.dataset.name === name);
   }
@@ -1049,39 +1039,29 @@ function selectSegment(name) {
 
 function renderList(items) {
   _items = items;
-  document.getElementById('count').textContent = items.length;
   document.getElementById('hdr-segs').textContent = items.length;
 
   if (items.length === 0) {
-    listEl.innerHTML = '<div class="empty-msg">Nenhum segmento ainda.</div>';
-    quickbar.innerHTML = '<div class="qb-item placeholder">sem gravações</div>';
+    quickbar.innerHTML =
+      '<div class="quickbar-empty">Nenhum segmento ainda.</div>';
     return;
   }
 
-  listEl.innerHTML = items.map(it => `
-    <div class="item${it.name === _selected ? ' active' : ''}" data-name="${it.name}">
+  // loading="lazy" + decoding="async" → o browser só baixa o thumb quando
+  // ele entra no viewport horizontal da quickbar (rolagem lateral).
+  quickbar.innerHTML = items.map(it => {
+    const time = it.label.split(' ')[1] || it.label;
+    const tip  = `${it.label} — ${fmtBytes(it.size)}`;
+    return `
+    <div class="qb-item${it.name === _selected ? ' active' : ''}"
+         data-name="${it.name}" title="${tip}">
       ${it.thumbnail
-        ? `<img class="thumb" src="/files/${encodeURIComponent(it.thumbnail)}" alt="">`
-        : `<div class="thumb placeholder">no thumb</div>`}
-      <div class="meta">
-        <div class="when">${it.label}</div>
-        <div class="sub">${fmtBytes(it.size)}</div>
-      </div>
-    </div>
-  `).join('');
-  for (const el of listEl.querySelectorAll('.item')) {
-    el.addEventListener('click', () => selectSegment(el.dataset.name));
-  }
-
-  // Quickbar — same items, sorted newest → oldest, compact.
-  quickbar.innerHTML = items.map(it => `
-    <div class="qb-item${it.name === _selected ? ' active' : ''}" data-name="${it.name}">
-      ${it.thumbnail
-        ? `<img src="/files/${encodeURIComponent(it.thumbnail)}" alt="">`
+        ? `<img loading="lazy" decoding="async"
+                src="/files/${encodeURIComponent(it.thumbnail)}" alt="">`
         : ''}
-      <div class="label">${it.label.split(' ')[1] || it.label}</div>
-    </div>
-  `).join('');
+      <div class="label">${time}</div>
+    </div>`;
+  }).join('');
   for (const el of quickbar.querySelectorAll('.qb-item')) {
     el.addEventListener('click', () => selectSegment(el.dataset.name));
   }
@@ -1265,14 +1245,24 @@ function drawDets(dets) {
 
 function findSegDets(tMs) {
   if (!_segDets.length) return [];
-  let lo = 0, hi = _segDets.length - 1, best = 0;
+  // Acha a maior entrada com t <= tMs.
+  let lo = 0, hi = _segDets.length - 1, prev = 0;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    if (_segDets[mid].t <= tMs) { best = mid; lo = mid+1; }
+    if (_segDets[mid].t <= tMs) { prev = mid; lo = mid+1; }
     else                         { hi = mid-1; }
   }
-  const e = _segDets[best];
-  return (e && (tMs - e.t) < 500) ? (e.dets || []) : [];
+  // Compara com a próxima (se existir) e usa a mais próxima de tMs nas
+  // duas direções. Reduz pela metade a latência percebida do overlay
+  // (sem isso só se vê detecções "passadas", nunca as do frame seguinte).
+  let nearest = prev;
+  if (prev + 1 < _segDets.length) {
+    const dPrev = tMs - _segDets[prev].t;
+    const dNext = _segDets[prev + 1].t - tMs;
+    if (dNext < dPrev) nearest = prev + 1;
+  }
+  const e = _segDets[nearest];
+  return (e && Math.abs(tMs - e.t) < 500) ? (e.dets || []) : [];
 }
 
 function renderFromVideo() {
@@ -1290,6 +1280,10 @@ function setOverlayVisible(on) {
 }
 
 aiToggle.addEventListener('click', () => setOverlayVisible(!_aiOn));
+
+// Liga overlay por padrão. Tem que passar pelo setOverlayVisible() pra
+// aplicar a classe .on no canvas (display:block) e chamar resizeOverlay().
+setOverlayVisible(true);
 
 async function loadModels() {
   try {
@@ -1357,9 +1351,12 @@ function updateSseStream() {
         document.getElementById('hdr-ai').textContent = _liveDets.length;
         console.log('SSE dets:', _liveDets.length, j);
         if (_aiOn) {
-          // Recalcula overlay geometry caso a imagem MJPEG tenha atualizado
-          // naturalWidth só agora (o evento load não dispara por frame).
-          if (!overlay._draw) resizeOverlay();
+          // Recalcula overlay geometry SEMPRE: o MJPEG só ganha dimensões
+          // quando o primeiro frame renderiza, e o `load` event do <img>
+          // pode disparar antes da SSE message chegar. Recalcular por
+          // mensagem garante que a primeira detecção depois do MJPEG
+          // ficar pronto vai pegar _draw válido. Custo: ~3 µs por msg.
+          resizeOverlay();
           drawDets(_liveDets);
         }
       } catch (err) {
@@ -1406,8 +1403,18 @@ selectSegment = function(name) {
 const _origStartLive = startLive;
 startLive = function() { _origStartLive(); updateSseStream(); };
 const _origStopLive  = stopLive;
-stopLive  = function() { _origStopLive(); updateSseStream();
-                         octx.clearRect(0,0,overlay.width,overlay.height); };
+stopLive = function() {
+  _origStopLive();
+  updateSseStream();
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  // Player voltou — recalcula geometria do overlay no próximo frame
+  // (depois do reflow do browser), senão fica com as dimensões menores
+  // que o liveImg tinha.
+  requestAnimationFrame(() => {
+    resizeOverlay();
+    if (_aiOn && _selected) renderFromVideo();
+  });
+};
 
 // Redraw hooks
 // rVFC usa `player` dinâmico → se rebind no ativo após cada swap.
@@ -1764,14 +1771,21 @@ def parse_args():
     p.add_argument("--model-threshold", type=float, default=0.5,
                    dest="model_threshold",
                    help="Score threshold do modelo (padrão: 0.5)")
-    p.add_argument("--live-fps", type=int, default=8, dest="live_fps",
-                   help="FPS máximo do preview MJPEG (padrão: 8)")
-    p.add_argument("--live-jpeg-quality", type=int, default=60,
+    p.add_argument("--live-fps", type=int, default=10, dest="live_fps",
+                   help="FPS máximo do preview MJPEG (padrão: 10).")
+    p.add_argument("--live-jpeg-quality", type=int, default=35,
                    dest="live_jpeg_quality",
-                   help="Qualidade JPEG do preview, 1-100 (padrão: 60)")
-    p.add_argument("--live-scale", type=float, default=0.5,
+                   help="Qualidade JPEG do preview, 1-100 (padrão: 35). "
+                        "Valores baixos reduzem bytes/CPU, viabilizando fps "
+                        "maior; o preview é só pra ajustes, qualidade é "
+                        "secundária.")
+    # scale=1.0 → HW JPEG encoder do CVI (quase zero CPU). scale<1 cai no
+    # caminho SW (cv::cvtColor + resize + imencode), que rouba ~30-40ms da
+    # CPU única do CV181X por frame e atrasa o pacing da gravação.
+    p.add_argument("--live-scale", type=float, default=1.0,
                    dest="live_scale",
-                   help="Fator de escala do preview (padrão: 0.5)")
+                   help="Fator de escala do preview (padrão: 1.0 = HW JPEG; "
+                        "valores <1 forçam encode em SW e impactam a gravação)")
     p.add_argument("--web-port", type=int, default=9001, dest="web_port",
                    help="Porta do servidor web (padrão: 9001)")
     return p.parse_args()

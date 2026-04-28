@@ -1,4 +1,5 @@
 #include "py_video_recorder.hpp"
+#include <cstdio>
 #include "image/base_image.hpp"
 #include "image/vpss_image.hpp"
 #include "utils/tdl_log.hpp"
@@ -26,7 +27,15 @@ PyVideoRecorder::PyVideoRecorder(int32_t width, int32_t height,
       jpeg_chn);
 }
 
-PyVideoRecorder::~PyVideoRecorder() { rec_.reset(); }
+PyVideoRecorder::~PyVideoRecorder() {
+  if (broken_) {
+    // VENC channel is corrupted — releasing it would block in DestroyChn.
+    // Leak intentionally; process is exiting anyway.
+    (void)rec_.release();
+    return;
+  }
+  rec_.reset();
+}
 
 void PyVideoRecorder::sendFrame(const PyImage& image) {
   if (!rec_) throw std::runtime_error("VideoRecorder is closed");
@@ -40,7 +49,17 @@ void PyVideoRecorder::sendFrame(const PyImage& image) {
     py::gil_scoped_release nogil;
     ret = rec_->sendFrame(fi);
   }
-  if (ret != 0) LOGE("[PyVideoRecorder] sendFrame failed: %d", ret);
+  if (ret != 0) {
+    // Mark broken so close()/destructor skip rec_.reset() — calling
+    // DestroyChn on a VENC channel that returned BUSY (0xC0078012)
+    // blocks in the driver waitqueue (D-state, only reboot recovers).
+    broken_ = true;
+    LOGE("[PyVideoRecorder] sendFrame failed: %d", ret);
+    throw std::runtime_error(
+        "VideoRecorder.send_frame failed: 0x" +
+        [&]{ char b[16]; std::snprintf(b, sizeof(b), "%X", ret); return std::string(b); }() +
+        " — recorder unusable, do not call close()");
+  }
 }
 
 void PyVideoRecorder::rotate() {
@@ -50,6 +69,15 @@ void PyVideoRecorder::rotate() {
 void PyVideoRecorder::close() {
   // Explicitly release the recorder to finalize the last MP4 segment.
   // Safe to call multiple times.
+  if (broken_) {
+    // See ~PyVideoRecorder() — leak instead of triggering D-state.
+    (void)rec_.release();
+    return;
+  }
+  // VideoRecorder destructor → VENC StopRecvFrame/DestroyChn can block
+  // for hundreds of ms (waiting encoder drain). Release the GIL so the
+  // Python main thread (or watchdog) can run during this time.
+  py::gil_scoped_release nogil;
   rec_.reset();
 }
 

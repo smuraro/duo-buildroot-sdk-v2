@@ -50,6 +50,13 @@ class PyVideoRecorder {
 
  private:
   std::unique_ptr<VideoRecorder> rec_;
+  // Set when sendFrame returns a fatal VENC error (e.g. 0xC0078012 BUSY).
+  // The encoder channel is in a corrupted state and calling DestroyChn
+  // would block in the driver waitqueue (uninterruptible D-state). Both
+  // close() and ~PyVideoRecorder() check this and intentionally LEAK the
+  // VideoRecorder (release() instead of reset()) to avoid the trava.
+  // The leak is harmless because it only happens on the way to process exit.
+  bool broken_ = false;
 };
 
 }  // namespace pytdl

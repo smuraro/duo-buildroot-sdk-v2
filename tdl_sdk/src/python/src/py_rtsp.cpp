@@ -10,9 +10,14 @@
 #if defined(__CV181X__) || defined(__CV180X__) || defined(__CV182X__) || \
     defined(__CV183X__) || defined(__CV184X__) || defined(__CV186X__)
 #include "encoder/image_encoder/image_encoder.hpp"
-// JPEG uses VENC channel 1 (channel 0 is reserved for H264/H265 streaming).
+// Live JPEG uses VENC channel 2.
+//   chn 0 — H.264/H.265 stream do VideoRecorder
+//   chn 1 — thumbnail .jpg (Create/Destroy per segment switch — destruiria
+//           o canal do live JPEG se compartilhado)
+//   chn 2 — live preview HW JPEG (este singleton, vida toda do processo)
+static constexpr int LIVE_JPEG_VENC_CHN = 2;
 static ImageEncoder& hwJpegEncoder() {
-  static ImageEncoder enc(1);
+  static ImageEncoder enc(LIVE_JPEG_VENC_CHN);
   return enc;
 }
 #endif
@@ -1159,7 +1164,8 @@ py::bytes frameToJpeg(const PyImage& image, int quality, float scale) {
   // smaller resolution directly (faster than HW encode + SW decode + resize).
   if (scale >= 1.0f) {
     std::vector<uint8_t> hw_buf;
-    if (hwJpegEncoder().encodeFrame(image.getImage(), hw_buf, 1, quality)) {
+    if (hwJpegEncoder().encodeFrame(image.getImage(), hw_buf,
+                                    LIVE_JPEG_VENC_CHN, quality)) {
       return py::bytes(reinterpret_cast<const char*>(hw_buf.data()), hw_buf.size());
     }
   }

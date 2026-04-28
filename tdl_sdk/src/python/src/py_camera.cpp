@@ -60,8 +60,11 @@ int32_t PyCamera::release(int32_t channel) {
 
 void PyCamera::close() {
   if (!closed_ && decoder_) {
-    decoder_.reset();
+    // VideoDecoder destructor (VPSS/VI Destroy*) can block — release the
+    // GIL so the Python main thread / watchdog can run during this time.
     closed_ = true;
+    py::gil_scoped_release nogil;
+    decoder_.reset();
   }
 }
 
