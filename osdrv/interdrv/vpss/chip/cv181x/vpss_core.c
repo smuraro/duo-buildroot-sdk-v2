@@ -1741,7 +1741,11 @@ static int vpss_core_suspend(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct cvi_vip_dev *vdev = dev_get_drvdata(&pdev->dev);
-	vpss_suspend();
+
+	/* Sem cliente com /dev/cvi-vpss aberto, nao ha state pra suspender. */
+	if (atomic_read(&open_count) > 0)
+		vpss_suspend();
+
 	devm_free_irq(&pdev->dev, vdev->irq_num_scl, vdev);
 	return 0;
 }
@@ -1756,6 +1760,16 @@ static int vpss_core_resume(struct device *dev)
 				vdev->irq_num_scl);
 		return -EINVAL;
 	}
+
+	/* Sem cliente, nao reabrir clocks nem reiniciar handlers — o
+	 * vpss_resume_handler colocaria handlers em RUN state e o
+	 * vpss_handle_online ficaria processando Grp invalido. Proxima
+	 * abertura de /dev/cvi-vpss faz init completo. */
+	if (atomic_read(&open_count) == 0) {
+		pr_info("vpss_core_resume: no active client, skipping resume\n");
+		return 0;
+	}
+
 	vpss_resume();
 	return 0;
 }

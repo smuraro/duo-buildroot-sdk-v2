@@ -4588,13 +4588,24 @@ void vi_suspend(struct cvi_vi_dev *vdev)
 
 void vi_resume(struct cvi_vi_dev *vdev)
 {
-
 	union vip_sys_reset isp_rst;
+
+	/* Se nenhum cliente tem /dev/cvi-vi aberto, o pipeline foi destruido
+	 * pelo cliente (ex: tdl_sdk chamou DestroyVi e o processo terminou).
+	 * Nao fazer NADA: nem reset, nem restore. Restore com state cached
+	 * travava o resume; reset sem restore deixava o ISP em estado misto
+	 * que quebrava a proxima abertura de Camera(). A proxima abertura
+	 * fara init completo do pipeline do zero. */
+	if (atomic_read(&dev_open_cnt) == 0) {
+		vi_pr(VI_INFO, "vi_resume: no active client, skipping reset+restore\n");
+		return;
+	}
 
 	isp_rst.raw = 0;
 	isp_rst.b.isp_top = 1;
 	isp_rst.b.isp_top_apb = 1;
 	vip_toggle_reset(isp_rst);
+
 	vdev->ctx.is_pre_trig_first = false;
 	vdev->ctx.is_post_trig_first = false;
 	vdev->ctx.tuning_update_en = true;
