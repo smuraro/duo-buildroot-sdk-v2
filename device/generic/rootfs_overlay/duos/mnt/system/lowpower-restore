@@ -1,0 +1,188 @@
+#!/bin/sh
+# Reverte o que o 'lowpower' aplicou. Le o estado de /tmp/lowpower.state.
+#
+# Uso:
+#   lowpower-restore         # reverte tudo
+#   lowpower-restore <stage> # reverte so um estagio
+#
+# OBS: a aplicacao DVR (sample_dvr.py) NAO e relancada automaticamente.
+# Se /mnt/data/dvr_enabled existir, o boot via S99user re-inicia. Em runtime,
+# rode 'sh /mnt/system/auto.sh &' ou simplesmente reboot.
+
+STATE=/tmp/lowpower.state
+SYSTEM_DIR=/mnt/system
+
+log() { echo "[restore] $*"; }
+get() { grep "^$1=" "$STATE" 2>/dev/null | tail -1 | cut -d= -f2- ; }
+applied() { grep -q "^STAGE_$1=1" "$STATE" 2>/dev/null; }
+
+restore_cpu() {
+    applied cpu || { log "cpu: nao foi aplicado, pulando"; return; }
+
+    # Caminho 1: cpufreq, se foi usado.
+    cpufreq=/sys/devices/system/cpu/cpu0/cpufreq
+    if [ -d "$cpufreq" ] && [ -n "$(get ORIG_GOVERNOR)" ]; then
+        gov="$(get ORIG_GOVERNOR)"
+        freq="$(get ORIG_FREQ)"
+        echo "$gov" > $cpufreq/scaling_governor 2>/dev/null
+        if [ "$gov" = "userspace" ] && [ -n "$freq" ]; then
+            echo "$freq" > $cpufreq/scaling_setspeed 2>/dev/null
+        fi
+        log "cpu: cpufreq governor=$gov freq=$freq kHz"
+        return
+    fi
+
+    # Caminho 2: cooling device.
+    cdev="$(get ORIG_COOLING_DEV)"
+    state="$(get ORIG_COOLING_STATE)"
+    if [ -n "$cdev" ] && [ -e "$cdev/cur_state" ]; then
+        echo "$state" > "$cdev/cur_state" 2>/dev/null
+        log "cpu: cooling device cur_state restaurado para $state"
+    else
+        log "cpu: estado original nao encontrado, pulando"
+    fi
+}
+
+restore_eth() {
+    applied eth || return
+    [ -e /sys/class/net/eth0 ] || return
+    if command -v ethtool >/dev/null 2>&1; then
+        ethtool --set-priv-flags eth0 power-down off 2>/dev/null
+    fi
+    state="$(get ORIG_ETH_STATE)"
+    if [ "$state" = "up" ]; then
+        ip link set eth0 up 2>/dev/null
+        log "eth: eth0 religada (estava up)"
+    else
+        log "eth: eth0 estava down, mantendo"
+    fi
+}
+
+restore_pwm() {
+    applied pwm || return
+    [ -f "$SYSTEM_DIR/ko/cv181x_pwm.ko" ] && \
+        insmod "$SYSTEM_DIR/ko/cv181x_pwm.ko" 2>/dev/null && \
+        log "pwm: insmod cv181x_pwm" || log "pwm: ja carregado"
+}
+
+restore_usb() {
+    applied usb || return
+    log "usb: rebind dwc2, religando VBUS e papel OTG..."
+
+    # Rebind do dwc2 antes do VBUS — driver precisa estar ligado pra
+    # responder ao power-on.
+    dwc2_drv=/sys/bus/platform/drivers/dwc2
+    dev="$(get ORIG_DWC2_DEV)"
+    if [ -d "$dwc2_drv" ] && [ -n "$dev" ]; then
+        echo "$dev" > "$dwc2_drv/bind" 2>/dev/null && \
+            log "  bind dwc2: $dev" || \
+            log "  bind falhou: $dev (talvez ja esteja bindado)"
+    fi
+
+    [ -e /sys/class/gpio/gpio453/value ] && \
+        echo 1 > /sys/class/gpio/gpio453/value 2>/dev/null
+    role="$(get ORIG_OTG_ROLE)"
+    [ -z "$role" ] && role=host
+    [ -w /proc/cviusb/otg_role ] && \
+        echo "$role" > /proc/cviusb/otg_role 2>/dev/null
+    log "usb: VBUS=on, otg_role=$role"
+}
+
+restore_wifi() {
+    applied wifi || return
+    log "wifi: recarregando aic8800 e religando..."
+
+    [ -e /sys/class/gpio/gpio362/value ] && \
+        echo 1 > /sys/class/gpio/gpio362/value 2>/dev/null
+
+    insmod "$SYSTEM_DIR/ko/aic8800_bsp.ko"  2>/dev/null && log "  insmod aic8800_bsp"
+    sleep 0.5
+    insmod "$SYSTEM_DIR/ko/aic8800_fdrv.ko" 2>/dev/null && log "  insmod aic8800_fdrv"
+
+    # Espera wlan0 aparecer (mesmo padrao do duo-init.sh).
+    i=0
+    while ! ip link show wlan0 >/dev/null 2>&1 && [ $i -lt 30 ]; do
+        sleep 0.5; i=$((i+1))
+    done
+    ip link show wlan0 >/dev/null 2>&1 || { log "wifi: wlan0 nao apareceu"; return; }
+
+    mode="$(get ORIG_WIFI_MODE)"
+    if [ -f "$SYSTEM_DIR/wifi-lib.sh" ]; then
+        # shellcheck disable=SC1091
+        . "$SYSTEM_DIR/wifi-lib.sh"
+        case "$mode" in
+            ap)     wifi_start_ap     2>/dev/null; log "  modo restaurado: AP" ;;
+            client) wifi_start_client 2>/dev/null; log "  modo restaurado: client" ;;
+            *)      log "  wlan0 carregada, modo previo era '$mode' — sem auto-start" ;;
+        esac
+    fi
+}
+
+restore_video() {
+    applied video || return
+    log "video: recarregando kernel modules do pipeline..."
+    if [ -x "$SYSTEM_DIR/ko/loadsystemko.sh" ]; then
+        sh "$SYSTEM_DIR/ko/loadsystemko.sh"
+        log "video: loadsystemko.sh executado. Para reiniciar o DVR:"
+        log "       sh $SYSTEM_DIR/auto.sh &     (ou reboot)"
+    else
+        log "video: $SYSTEM_DIR/ko/loadsystemko.sh nao encontrado"
+    fi
+}
+
+restore_freertos() {
+    applied freertos || return
+    if ! command -v devmem >/dev/null 2>&1; then
+        log "freertos: devmem nao disponivel, pulando"
+        return
+    fi
+    orig="$(get ORIG_C906L_RESET)"
+    if [ -z "$orig" ]; then
+        log "freertos: valor original nao salvo, pulando"
+        return
+    fi
+    devmem 0x03003024 32 "$orig"
+    log "freertos: 0x03003024 restaurado para $orig (release reset)"
+    log "  AVISO: C906L pode estar em estado nao-deterministico apos halt."
+    log "         Se houver falha em ISP/audio/RGN apos restore, faca reboot."
+}
+
+restore_plls() {
+    # Estagio de report; nao tem nada pra reverter.
+    applied plls || return
+    log "plls: nada a reverter (estagio era read-only)"
+}
+
+# ---- main ----
+[ "$(id -u)" -eq 0 ] || { echo "lowpower-restore: precisa ser root"; exit 1; }
+
+if [ ! -f "$STATE" ]; then
+    echo "lowpower-restore: nada a reverter (sem $STATE)"
+    exit 0
+fi
+
+case "${1:-all}" in
+    all)
+        # Ordem reversa do apply: freertos antes de video pra evitar
+        # que rtos_cmdqu suba contra um C906L em halt.
+        restore_plls
+        restore_cpu
+        restore_pwm
+        restore_usb
+        restore_eth
+        restore_wifi
+        restore_freertos
+        restore_video
+        rm -f "$STATE"
+        log "tudo revertido. Estado limpo."
+        ;;
+    cpu)      restore_cpu      ; sed -i '/^STAGE_cpu=1$/d'      "$STATE" ;;
+    pwm)      restore_pwm      ; sed -i '/^STAGE_pwm=1$/d'      "$STATE" ;;
+    usb)      restore_usb      ; sed -i '/^STAGE_usb=1$/d'      "$STATE" ;;
+    eth)      restore_eth      ; sed -i '/^STAGE_eth=1$/d'      "$STATE" ;;
+    wifi)     restore_wifi     ; sed -i '/^STAGE_wifi=1$/d'     "$STATE" ;;
+    freertos) restore_freertos ; sed -i '/^STAGE_freertos=1$/d' "$STATE" ;;
+    video)    restore_video    ; sed -i '/^STAGE_video=1$/d'    "$STATE" ;;
+    plls)     restore_plls     ; sed -i '/^STAGE_plls=1$/d'     "$STATE" ;;
+    *) echo "lowpower-restore: estagio desconhecido '$1'"; exit 1 ;;
+esac

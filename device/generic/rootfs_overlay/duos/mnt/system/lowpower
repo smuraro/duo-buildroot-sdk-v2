@@ -1,0 +1,324 @@
+#!/bin/sh
+# Aplica modo "low-power" desligando perifericos e reduzindo clock da CPU,
+# em estagios independentes pra permitir medir o consumo incremental.
+#
+# Uso:
+#   lowpower [video] [freertos] [wifi] [eth] [usb] [cpu] [pwm] [plls]
+#   lowpower all                 # aplica tudo
+#   lowpower --status            # mostra o que ja foi aplicado
+#
+# AVISO: o estagio "wifi" derruba wlan0. Se voce esta logado via SSH no AP
+# do Duo, vai perder a sessao. Use serial/USB-NCM nesses casos.
+#
+# AVISO: o estagio "freertos" coloca o C906L (segunda CPU RISC-V) em halt.
+# Pre-requisito: rodar "lowpower video" antes (descarrega rtos_cmdqu).
+# No restore o estado pode nao voltar limpo — se houver problema, reboot.
+#
+# Estado em /tmp/lowpower.state (consumido pelo lowpower-restore).
+
+STATE=/tmp/lowpower.state
+SYSTEM_DIR=/mnt/system
+
+log()  { echo "[lowpower] $*"; }
+done_stage() { grep -q "^STAGE_$1=1" "$STATE" 2>/dev/null; }
+mark()  { echo "STAGE_$1=1" >> "$STATE"; }
+save()  { echo "$1=$2" >> "$STATE"; }
+
+stage_video() {
+    if done_stage video; then log "video: ja aplicado, pulando"; return; fi
+    log "video: parando app DVR e descarregando pipeline..."
+
+    # 1. App de userspace que segura VI/VPSS/VENC.
+    save ORIG_DVR_PID "$(pidof python3 2>/dev/null | tr ' ' ',')"
+    killall -TERM python3 2>/dev/null
+    sleep 1
+    killall -KILL python3 2>/dev/null
+    killall -KILL sample_dvr.py 2>/dev/null
+
+    # 2. Codec/TPU/IVE primeiro (clientes do pipeline). cvi_fb pode estar
+    # carregado mesmo nao listado em loadsystemko.sh (bootlogo deixa tracos).
+    # NOTE: cv181x_clock_cooling NAO entra aqui — e usado pelo estagio 'cpu'
+    # como cooling device pra reduzir freq do C906_0.
+    for m in cvi_vc_driver cv181x_jpeg cv181x_vcodec cv181x_tpu \
+             cv181x_ive cvi_fb; do
+        rmmod "$m" 2>/dev/null && log "  rmmod $m"
+    done
+
+    # 3. Pipeline de video em ordem reversa do loadsystemko.sh.
+    for m in cv181x_rgn cv181x_mipi_tx cv181x_vo cv181x_dwa \
+             cv181x_vpss cv181x_vi snsr_i2c cvi_mipi_rx \
+             cv181x_fast_image cv181x_rtos_cmdqu cv181x_base cv181x_sys; do
+        rmmod "$m" 2>/dev/null && log "  rmmod $m"
+    done
+
+    mark video
+    log "video: OK"
+}
+
+stage_wifi() {
+    if done_stage wifi; then log "wifi: ja aplicado, pulando"; return; fi
+    log "wifi: parando daemons e descarregando aic8800..."
+
+    # Salva o modo atual pro restore reativar igual.
+    if [ -f /var/run/wifi_mode ]; then
+        save ORIG_WIFI_MODE "$(cat /var/run/wifi_mode)"
+    else
+        save ORIG_WIFI_MODE off
+    fi
+
+    # Para watchdog/hostapd/wpa_supplicant via wifi-lib.
+    if [ -f "$SYSTEM_DIR/wifi-lib.sh" ]; then
+        # shellcheck disable=SC1091
+        . "$SYSTEM_DIR/wifi-lib.sh"
+        wifi_stop_all 2>/dev/null
+    else
+        ifconfig wlan0 down 2>/dev/null
+    fi
+
+    rmmod aic8800_fdrv 2>/dev/null && log "  rmmod aic8800_fdrv"
+    rmmod aic8800_bsp  2>/dev/null && log "  rmmod aic8800_bsp"
+
+    # Solta o GPIO de host_wake_bt setado em duo-init.sh.
+    [ -e /sys/class/gpio/gpio362/value ] && \
+        echo 0 > /sys/class/gpio/gpio362/value 2>/dev/null
+
+    mark wifi
+    log "wifi: OK"
+}
+
+stage_usb() {
+    if done_stage usb; then log "usb: ja aplicado, pulando"; return; fi
+    log "usb: cortando VBUS, otg device-mode e unbind dwc2..."
+
+    # Salva estado original do papel OTG.
+    if [ -r /proc/cviusb/otg_role ]; then
+        save ORIG_OTG_ROLE "$(cat /proc/cviusb/otg_role 2>/dev/null)"
+    fi
+
+    # GPIO 453 (XGPIOB[5]) = usb_en em usb-host.sh. 0 = VBUS off.
+    [ -e /sys/class/gpio/gpio453/value ] && \
+        echo 0 > /sys/class/gpio/gpio453/value 2>/dev/null
+
+    # Tira do modo host (controlador volta pra device, gasta menos).
+    [ -w /proc/cviusb/otg_role ] && \
+        echo device > /proc/cviusb/otg_role 2>/dev/null
+
+    # Unbind do controlador dwc2 — sem isso clk_axi4_usb fica ligado mesmo
+    # com VBUS cortado. Device em 0x04340000 (cv181x_base_riscv.dtsi:371).
+    dwc2_drv=/sys/bus/platform/drivers/dwc2
+    if [ -d "$dwc2_drv" ]; then
+        for d in "$dwc2_drv"/*.usb; do
+            [ -e "$d" ] || continue
+            dev=$(basename "$d")
+            save ORIG_DWC2_DEV "$dev"
+            echo "$dev" > "$dwc2_drv/unbind" 2>/dev/null && \
+                log "  unbind dwc2: $dev" || \
+                log "  unbind falhou: $dev"
+        done
+    fi
+
+    mark usb
+    log "usb: OK"
+}
+
+stage_cpu() {
+    if done_stage cpu; then log "cpu: ja aplicado, pulando"; return; fi
+
+    # Caminho 1: cpufreq classico (nao habilitado neste kernel, mas mantido
+    # caso seja ligado no futuro).
+    cpufreq=/sys/devices/system/cpu/cpu0/cpufreq
+    if [ -d "$cpufreq" ]; then
+        save ORIG_GOVERNOR "$(cat $cpufreq/scaling_governor 2>/dev/null)"
+        save ORIG_FREQ     "$(cat $cpufreq/scaling_cur_freq 2>/dev/null)"
+        freqs="$(cat $cpufreq/scaling_available_frequencies 2>/dev/null)"
+        if [ -n "$freqs" ]; then
+            minfreq=$(echo "$freqs" | tr ' ' '\n' | sort -n | head -1)
+            echo userspace > $cpufreq/scaling_governor 2>/dev/null
+            echo "$minfreq" > $cpufreq/scaling_setspeed 2>/dev/null
+            log "cpu: cpufreq @ ${minfreq} kHz"
+            mark cpu
+            log "cpu: OK"
+            return
+        fi
+    fi
+
+    # Caminho 2: cv181x_clock_cooling (thermal cooling device).
+    # Cria 3 estados: 0=850MHz, 1=425MHz/TPU375, 2=425MHz/TPU300 (DTS)
+    # ver linux_5.10/arch/riscv/boot/dts/cvitek/cv181x_base_riscv.dtsi:90.
+    cdev=""
+    for d in /sys/class/thermal/cooling_device*; do
+        [ -e "$d/type" ] || continue
+        if grep -q "^cv181x_cooling$" "$d/type" 2>/dev/null; then
+            cdev="$d"
+            break
+        fi
+    done
+
+    if [ -z "$cdev" ]; then
+        log "cpu: nenhum cooling device cv181x encontrado"
+        log "     (cv181x_clock_cooling.ko carregado?)"
+        mark cpu
+        return
+    fi
+
+    cur="$(cat $cdev/cur_state 2>/dev/null)"
+    max="$(cat $cdev/max_state 2>/dev/null)"
+    save ORIG_COOLING_DEV   "$cdev"
+    save ORIG_COOLING_STATE "$cur"
+
+    echo "$max" > "$cdev/cur_state" 2>/dev/null
+    log "cpu: cooling device ${cdev##*/} state ${cur} -> ${max} (CPU 850->425 MHz, TPU 500->300 MHz)"
+    mark cpu
+    log "cpu: OK"
+}
+
+stage_pwm() {
+    if done_stage pwm; then log "pwm: ja aplicado, pulando"; return; fi
+    rmmod cv181x_pwm 2>/dev/null && log "pwm: rmmod cv181x_pwm" || \
+        log "pwm: nao carregado, pulando"
+    mark pwm
+}
+
+stage_eth() {
+    if done_stage eth; then log "eth: ja aplicado, pulando"; return; fi
+
+    if [ ! -e /sys/class/net/eth0 ]; then
+        log "eth: eth0 nao existe, pulando"
+        mark eth
+        return
+    fi
+
+    # Salva estado UP/DOWN.
+    if ip link show eth0 2>/dev/null | grep -q "state UP"; then
+        save ORIG_ETH_STATE up
+    else
+        save ORIG_ETH_STATE down
+    fi
+
+    log "eth: derrubando interface e tentando power-down do PHY..."
+    ip link set eth0 down 2>/dev/null
+
+    # Power-down do PHY via ethtool, se suportado.
+    if command -v ethtool >/dev/null 2>&1; then
+        ethtool --set-priv-flags eth0 power-down on 2>/dev/null || \
+            ethtool -s eth0 wol d 2>/dev/null
+    fi
+
+    mark eth
+    log "eth: OK (LEDs do PHY devem apagar)"
+}
+
+stage_freertos() {
+    if done_stage freertos; then log "freertos: ja aplicado, pulando"; return; fi
+
+    # Pre-requisito: cv181x_rtos_cmdqu nao pode estar carregado, senao
+    # comandos pendentes vao dar timeout.
+    if lsmod 2>/dev/null | grep -q "^cv181x_rtos_cmdqu"; then
+        log "freertos: ERRO - rode 'lowpower video' antes (rtos_cmdqu carregado)"
+        return
+    fi
+
+    if ! command -v devmem >/dev/null 2>&1; then
+        log "freertos: devmem nao disponivel, pulando"
+        return
+    fi
+
+    # Reg 0x03003024, bit 6 = release reset do C906L (vide
+    # fsbl/plat/cv181x/platform.c:reset_c906l).
+    cur=$(devmem 0x03003024 32 2>/dev/null)
+    if [ -z "$cur" ]; then
+        log "freertos: devmem read falhou, pulando"
+        return
+    fi
+    save ORIG_C906L_RESET "$cur"
+
+    # Limpa bit 6 -> hold em reset (halt).
+    new=$(printf '0x%08x' $(( cur & ~0x40 )))
+    devmem 0x03003024 32 "$new"
+    log "freertos: C906L em halt (0x03003024: $cur -> $new)"
+    mark freertos
+}
+
+stage_plls() {
+    # Read-only: relata quais PLLs e blocos ainda estao com refcount > 0.
+    # Sem CONFIG_COMMON_CLK_DEBUG nao da pra escrever; este estagio so
+    # serve como diagnostico pra estimar headroom de gating manual.
+    if done_stage plls; then log "plls: ja relatado, pulando"; return; fi
+
+    summary=/sys/kernel/debug/clk/clk_summary
+    if [ ! -r "$summary" ]; then
+        log "plls: $summary nao acessivel (debugfs nao montado?)"
+        mark plls
+        return
+    fi
+
+    log "plls: PLLs/blocos com clock ainda ativo (read-only):"
+    # clk_summary cols: name enable_cnt prepare_cnt protect_cnt rate accuracy phase
+    # Colunas variam por kernel; usa awk pra pegar nome e enable_cnt > 0.
+    awk '
+        BEGIN { found=0 }
+        /^[[:space:]]*clk_(fpll|mpll|tpll|a0pll|disppll|cam0pll|cam1pll|mipimpll)/ ||
+        /^[[:space:]]*clk_(c906_0|c906_1|tpu|h264c|h265c|jpeg|emmc|isp_top_vip|disp_vip|axi4_usb)/ {
+            # Pega nome (1o campo nao-whitespace) e enable_cnt (2o numero)
+            name=$1
+            ec=$2
+            if (ec+0 > 0) {
+                printf "  %-25s enable_cnt=%s rate=%s\n", name, ec, $5
+                found=1
+            }
+        }
+        END { if (!found) print "  (nenhum dos blocos rastreados ativo)" }
+    ' "$summary"
+
+    log "plls: kernel sem COMMON_CLK_DEBUG -> sem write. Para gating real"
+    log "      seria preciso patch no driver ou rmmod adicional."
+    mark plls
+}
+
+show_status() {
+    if [ ! -f "$STATE" ]; then echo "lowpower: nenhum estagio aplicado"; return; fi
+    echo "Estagios aplicados:"
+    grep "^STAGE_" "$STATE" | sed 's/STAGE_/  - /; s/=1//'
+    echo
+    echo "Estado salvo:"
+    grep -v "^STAGE_" "$STATE" | sed 's/^/  /'
+}
+
+# ---- main ----
+[ "$(id -u)" -eq 0 ] || { echo "lowpower: precisa ser root"; exit 1; }
+
+if [ $# -eq 0 ]; then
+    echo "Uso: $0 [video] [freertos] [wifi] [eth] [usb] [cpu] [pwm] [plls] | all | --status"
+    exit 1
+fi
+
+# Garante o arquivo de estado pra append.
+touch "$STATE"
+
+for arg in "$@"; do
+    case "$arg" in
+        --status|status) show_status; exit 0 ;;
+        all)
+            # Ordem importa: video descarrega rtos_cmdqu, pre-requisito do freertos.
+            stage_video
+            stage_freertos
+            stage_wifi
+            stage_eth
+            stage_usb
+            stage_cpu
+            stage_pwm
+            stage_plls
+            ;;
+        video)    stage_video    ;;
+        freertos) stage_freertos ;;
+        wifi)     stage_wifi     ;;
+        eth)      stage_eth      ;;
+        usb)      stage_usb      ;;
+        cpu)      stage_cpu      ;;
+        pwm)      stage_pwm      ;;
+        plls)     stage_plls     ;;
+        *) echo "lowpower: estagio desconhecido '$arg'"; exit 1 ;;
+    esac
+done
+
+log "concluido. Use 'lowpower-restore' para reverter."
