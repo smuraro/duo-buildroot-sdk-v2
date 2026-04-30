@@ -1,0 +1,19 @@
+#!/bin/sh
+# Alterna o Wi-Fi para modo AP imediatamente (mata client/watchdog se ativos).
+# Não persiste preferência: se /mnt/data/wpa_supplicant.conf existir, no
+# próximo boot o sistema vai tentar Client de novo. Use `wifi-client -d`
+# para remover essa config persistente.
+
+. /mnt/system/wifi-lib.sh
+
+wifi_stop_watchdog
+wifi_stop_client
+
+if wifi_start_ap; then
+    suffix=$(wifi_unique_suffix)
+    wifi_load_overrides
+    echo "[wifi-ap] AP ativo  SSID=${AP_SSID_PREFIX}-${suffix}  IP=$AP_IP"
+    exit 0
+fi
+echo "[wifi-ap] FALHOU ao iniciar AP — ver dmesg/journalctl" >&2
+exit 1

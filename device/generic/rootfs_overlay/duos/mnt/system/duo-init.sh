@@ -33,24 +33,31 @@ insmod /mnt/system/ko/aic8800_fdrv.ko
 # Insmod PWM Module
 insmod /mnt/system/ko/cv181x_pwm.ko
 
-# WiFi Access Point
+# Wi-Fi: decide AP vs Client conforme presença de /mnt/data/wpa_supplicant.conf.
+# - Sem config válida → sobe AP imediatamente (SSID único por MAC).
+# - Com config       → sobe Client + watchdog. Se não associar em N segundos
+#                      ou cair por > grace minutos, watchdog volta pra AP.
 (
-	for i in $(seq 1 30); do
-		ip link show wlan0 >/dev/null 2>&1 && break
-		sleep 0.5
-	done
-	if ip link show wlan0 >/dev/null 2>&1; then
-		killall -q wpa_supplicant 2>/dev/null
-		ifconfig wlan0 192.168.50.1 netmask 255.255.255.0 up
-		iw reg set BR 2>/dev/null
-		hostapd -B /etc/hostapd.conf
-		/etc/init.d/S80dnsmasq restart
+	. /mnt/system/wifi-lib.sh
 
-		# NAT: clientes WiFi saem pela interface upstream (eth0/usb0/etc.)
-		echo 1 > /proc/sys/net/ipv4/ip_forward
-		iptables -t nat -A POSTROUTING ! -o wlan0 -j MASQUERADE
-		iptables -A FORWARD -i wlan0 -j ACCEPT
-		iptables -A FORWARD -o wlan0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+	# wlan0 só aparece depois que aic8800_fdrv carrega — espera até 15s.
+	i=0
+	while ! ip link show $WIFI_IFACE >/dev/null 2>&1 && [ $i -lt 30 ]; do
+		sleep 0.5
+		i=$((i+1))
+	done
+	ip link show $WIFI_IFACE >/dev/null 2>&1 || exit 0
+
+	if wifi_client_config_ok; then
+		if wifi_start_client; then
+			# Watchdog em background — fallback automático pra AP.
+			setsid /mnt/system/wifi-watchdog </dev/null >/dev/null 2>&1 &
+		else
+			# Falha imediata na subida do supplicant: cai já pra AP.
+			wifi_start_ap
+		fi
+	else
+		wifi_start_ap
 	fi
 ) &
 

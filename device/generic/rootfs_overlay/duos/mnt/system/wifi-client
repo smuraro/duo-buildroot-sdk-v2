@@ -1,0 +1,410 @@
+#!/bin/sh
+# Alterna o Wi-Fi para modo Client. Inclui assistente de configuracao.
+#
+# Uso:
+#   wifi-client            -> sobe Client (config valida em /etc/wpa_supplicant.conf).
+#                             Se invalida + TTY interativo: oferece o assistente.
+#                             Se invalida + sem TTY: alerta e sai com erro.
+#   wifi-client -s         -> forca o assistente interativo (mesmo com config valida).
+#   wifi-client -f         -> forca subir mesmo sem config (vai falhar; cai pra AP).
+#   wifi-client -r         -> reset: restaura placeholder default e sobe AP agora.
+
+. /mnt/system/wifi-lib.sh
+
+# ---------------------------------------------------------------------------
+# Helpers do assistente
+# ---------------------------------------------------------------------------
+
+# Escapa string para uso dentro de "..." em wpa_supplicant.conf:
+# barras invertidas e aspas viram \\ e \".
+_escape_quoted() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# Lista os SSIDs ja configurados em /etc/wpa_supplicant.conf (1 por linha).
+# Inclui o placeholder "SSID" — o consumidor decide se filtra.
+_existing_ssids() {
+    [ -f "$WPA_SUPPLICANT_CONF" ] || return
+    awk '
+        /^[[:space:]]*network[[:space:]]*=[[:space:]]*\{/ { in_net=1; ssid=""; next }
+        in_net && /^[[:space:]]*\}/ {
+            if (ssid != "") print ssid
+            in_net=0; ssid=""; next
+        }
+        in_net && /^[[:space:]]*ssid[[:space:]]*=/ {
+            v=$0; sub(/^[[:space:]]*ssid[[:space:]]*=[[:space:]]*/, "", v)
+            if (v ~ /^".*"$/) v = substr(v, 2, length(v)-2)
+            ssid=v
+        }
+    ' "$WPA_SUPPLICANT_CONF"
+}
+
+# Le senha sem ecoar; restaura stty mesmo em Ctrl+C.
+_read_password() {
+    prompt="$1"
+    printf '%s' "$prompt" >&2
+    old=$(stty -g 2>/dev/null)
+    stty -echo 2>/dev/null
+    trap 'stty "$old" 2>/dev/null; echo >&2; exit 130' INT
+    IFS= read -r pw
+    stty "$old" 2>/dev/null
+    trap - INT
+    echo >&2
+    printf '%s' "$pw"
+}
+
+# Roda o assistente interativo. Em sucesso, deixa /etc/wpa_supplicant.conf
+# valido e devolve 0 + (na stdout) "go" se usuario quer conectar agora,
+# "stay" se quer apenas salvar e voltar pro AP. Em erro/cancel, devolve != 0.
+_run_setup_wizard() {
+    cat >&2 <<EOF
+=== wifi-client: assistente de configuracao ===
+O scan precisa parar o hostapd (libera $WIFI_IFACE).
+Se voce esta SSH'd VIA O AP do device, sua sessao vai cair.
+Em serial/USB (usb0) tudo ok.
+
+EOF
+    printf "Continuar? [s/N] " >&2
+    read ans
+    case "$ans" in
+        s|S|sim|Sim|y|Y|yes) ;;
+        *) echo "[wifi-client] assistente cancelado." >&2; return 1 ;;
+    esac
+
+    # Se ja existe config valida (>=1 network real, nao placeholder), pergunta
+    # se eh pra ADICIONAR ou SUBSTITUIR. Sem networks: silenciosamente substitui.
+    wizard_mode=replace
+    if wifi_client_config_ok; then
+        while :; do
+            echo >&2
+            echo "Ja existe config valida em $WPA_SUPPLICANT_CONF." >&2
+            printf "(a)dicionar nova rede / (s)ubstituir tudo / (l)istar / (c)ancelar [a/s/l/c] " >&2
+            read mode_ans
+            case "$mode_ans" in
+                a|A) wizard_mode=add; break ;;
+                s|S) wizard_mode=replace; break ;;
+                l|L)
+                    echo "Redes atuais:" >&2
+                    _existing_ssids | awk '$0 != "SSID" {printf "  %d. %s\n", NR, $0}' >&2
+                    ;;
+                c|C|"") echo "[wifi-client] assistente cancelado." >&2; return 1 ;;
+                *) echo "opcao invalida." >&2 ;;
+            esac
+        done
+        echo "[wifi-client] modo: $wizard_mode" >&2
+    fi
+
+    prev_mode=$(wifi_current_mode)
+
+    echo "[wifi-client] parando AP/cliente para liberar $WIFI_IFACE..." >&2
+    wifi_stop_watchdog
+    wifi_stop_client
+    wifi_stop_ap
+    ifconfig $WIFI_IFACE up
+    sleep 1
+
+    while :; do
+        echo "[wifi-client] escaneando (~5s)..." >&2
+        raw=$(iw dev $WIFI_IFACE scan 2>/dev/null)
+        if [ -z "$raw" ]; then
+            sleep 2
+            raw=$(iw dev $WIFI_IFACE scan 2>/dev/null)
+        fi
+
+        # Por BSS: "<sig>\t<sec>\t<bssid>\t<ssid>".
+        parsed=$(echo "$raw" | awk '
+            function emit() {
+                if (bssid == "") return
+                if (ssid == "") ssid = "<hidden>"
+                printf "%s\t%s\t%s\t%s\n", sig, sec, bssid, ssid
+            }
+            /^BSS [0-9a-fA-F]/ {
+                emit()
+                bssid=$2; sub(/\(.*$/, "", bssid)
+                ssid=""; sig="-999"; sec="OPEN"
+            }
+            /^[ \t]+signal:/ { sig=$2 }
+            /^[ \t]+SSID:/   { ssid=$0; sub(/^[ \t]+SSID: ?/, "", ssid) }
+            /^[ \t]+RSN:/    { sec="WPA2" }
+            /^[ \t]+WPA:/    { if (sec == "OPEN") sec="WPA" }
+            END { emit() }
+        ')
+
+        # Dedup por SSID mantendo o BSSID com sinal mais forte; oculta vazios.
+        # Em modo 'add', tambem omite SSIDs ja configurados (ruido — nao adianta
+        # adicionar de novo). Em 'replace' mostra tudo (pode ser reconfiguracao
+        # de uma rede ja conhecida com senha nova).
+        TAB=$(printf '\t')
+        if [ "$wizard_mode" = "add" ]; then
+            skip_ssids=$(_existing_ssids | grep -v '^SSID$')
+        else
+            skip_ssids=""
+        fi
+        list=$(echo "$parsed" | sort -t "$TAB" -k1,1 -gr | awk -F'\t' \
+                  -v skip="$skip_ssids" '
+            BEGIN {
+                n = split(skip, arr, "\n")
+                for (i = 1; i <= n; i++) if (arr[i] != "") known[arr[i]] = 1
+            }
+            $4 == "<hidden>"  { next }
+            ($4 in known)     { hidden_count++; next }
+            !seen[$4]++       { print }
+            END { if (hidden_count > 0) printf "#OMITIDAS=%d\n", hidden_count > "/dev/stderr" }
+        ' 2> /tmp/.wifi-scan-meta)
+        omitted=$(awk -F= '/^#OMITIDAS=/{print $2}' /tmp/.wifi-scan-meta 2>/dev/null)
+        rm -f /tmp/.wifi-scan-meta
+
+        if [ -z "$list" ]; then
+            echo "[wifi-client] nenhum AP visivel." >&2
+            [ -n "$omitted" ] && \
+                echo "[wifi-client] ($omitted ja configurada(s) — omitida(s))" >&2
+        else
+            echo >&2
+            printf "  %-3s %-32s %-6s %s\n" "#" "SSID" "Sig" "Sec" >&2
+            echo "  ----------------------------------------------------------" >&2
+            i=1
+            # Loop iterando linha a linha sem subshell perdido.
+            while IFS="$TAB" read -r sig sec bssid ssid; do
+                printf "  %-3d %-32.32s %-6s %s\n" "$i" "$ssid" "$sig" "$sec" >&2
+                i=$((i+1))
+            done <<EOF
+$list
+EOF
+            [ -n "$omitted" ] && \
+                echo "  ($omitted ja configurada(s) — omitida(s) da lista)" >&2
+        fi
+
+        echo >&2
+        echo "Opcoes: <numero> selecionar | r rescan | m SSID manual | q cancelar" >&2
+        printf "> " >&2
+        read choice
+
+        case "$choice" in
+            r|R) continue ;;
+            q|Q|"")
+                echo "[wifi-client] cancelado; restaurando $prev_mode..." >&2
+                case "$prev_mode" in
+                    ap)
+                        wifi_start_ap
+                        ;;
+                    client)
+                        if wifi_start_client; then
+                            setsid /mnt/system/wifi-watchdog \
+                                </dev/null >/dev/null 2>&1 &
+                        else
+                            echo "[wifi-client] start_client falhou; subindo AP." >&2
+                            wifi_start_ap
+                        fi
+                        ;;
+                esac
+                return 1
+                ;;
+            m|M)
+                printf "SSID: " >&2; read ssid_sel
+                [ -z "$ssid_sel" ] && { echo "SSID vazio." >&2; continue; }
+                printf "Aberto/sem senha? [s/N] " >&2; read open
+                case "$open" in
+                    s|S|sim|Sim|y|Y|yes) sec_sel="OPEN" ;;
+                    *) sec_sel="WPA2" ;;
+                esac
+                break
+                ;;
+            *)
+                case "$choice" in
+                    ''|*[!0-9]*) echo "entrada invalida." >&2; continue ;;
+                esac
+                sel=$(echo "$list" | sed -n "${choice}p")
+                if [ -z "$sel" ]; then
+                    echo "indice fora da lista." >&2; continue
+                fi
+                ssid_sel=$(echo "$sel" | awk -F'\t' '{print $4}')
+                sec_sel=$(echo "$sel" | awk -F'\t' '{print $2}')
+                break
+                ;;
+        esac
+    done
+
+    echo "[wifi-client] selecionado: SSID='$ssid_sel'  seguranca=$sec_sel" >&2
+
+    psk_sel=""
+    if [ "$sec_sel" != "OPEN" ]; then
+        while :; do
+            psk_sel=$(_read_password "Senha (8-63 caracteres): ")
+            len=${#psk_sel}
+            if [ "$len" -ge 8 ] && [ "$len" -le 63 ]; then
+                break
+            fi
+            echo "senha precisa ter 8-63 chars (digitou $len)." >&2
+        done
+    fi
+
+    ssid_esc=$(_escape_quoted "$ssid_sel")
+    psk_esc=$(_escape_quoted "$psk_sel")
+    tmp=/tmp/wpa_supplicant.conf.new
+
+    # Bloco network={} novo (comum aos dois modos).
+    new_block=$(
+        echo "network={"
+        printf '\tssid="%s"\n' "$ssid_esc"
+        if [ "$sec_sel" = "OPEN" ]; then
+            echo "	key_mgmt=NONE"
+        else
+            printf '\tpsk="%s"\n' "$psk_esc"
+            echo "	key_mgmt=WPA-PSK"
+        fi
+        echo "}"
+    )
+
+    if [ "$wizard_mode" = "add" ]; then
+        # Anexa: copia conf existente, garante \n no fim, adiciona o bloco.
+        cp "$WPA_SUPPLICANT_CONF" "$tmp"
+        # Garante newline final antes de anexar (evita "}network={" colado).
+        [ -n "$(tail -c 1 "$tmp")" ] && echo >> "$tmp"
+        echo >> "$tmp"
+        printf '%s\n' "$new_block" >> "$tmp"
+    else
+        # Substitui: cabecalho fresco + bloco novo.
+        {
+            echo "ctrl_interface=/var/run/wpa_supplicant"
+            echo "ap_scan=1"
+            echo "update_config=1"
+            echo
+            printf '%s\n' "$new_block"
+        } > "$tmp"
+    fi
+
+    [ -f "$WPA_SUPPLICANT_CONF" ] && cp "$WPA_SUPPLICANT_CONF" "${WPA_SUPPLICANT_CONF}.bak"
+    mv "$tmp" "$WPA_SUPPLICANT_CONF"
+    chmod 600 "$WPA_SUPPLICANT_CONF"
+    echo "[wifi-client] gravado em $WPA_SUPPLICANT_CONF (backup .bak, modo=$wizard_mode)" >&2
+
+    echo >&2
+    printf "Conectar agora? Watchdog devolve AP em ~60s se senha errada. [S/n] " >&2
+    read go
+    case "$go" in
+        n|N|no|nao|Nao) echo "stay" ;;
+        *)              echo "go" ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Parse de args
+# ---------------------------------------------------------------------------
+
+force=0
+setup=0
+case "$1" in
+    -f|--force)  force=1 ;;
+    -s|--setup)  setup=1 ;;
+    -r|--reset)
+        cat > "$WPA_SUPPLICANT_CONF" <<'PLACEHOLDER'
+ctrl_interface=/var/run/wpa_supplicant
+ap_scan=1
+update_config=1
+
+network={
+	ssid="SSID"
+	psk="PASSWORD"
+	key_mgmt=WPA-PSK
+}
+PLACEHOLDER
+        echo "[wifi-client] $WPA_SUPPLICANT_CONF resetado para placeholder; subindo AP."
+        wifi_stop_watchdog
+        wifi_stop_client
+        wifi_start_ap
+        exit $?
+        ;;
+    "" ) ;;
+    -h|--help|*)
+        cat <<EOF
+Uso: wifi-client [-s|--setup | -f|--force | -r|--reset]
+
+Sobe o Wi-Fi em modo Client.
+
+Sem opcao: usa $WPA_SUPPLICANT_CONF se valido. Se invalido e TTY interativo,
+           oferece o assistente; sem TTY, alerta e sai.
+  -s       roda o assistente interativo (scan + menu + senha + grava conf)
+  -f       forca tentativa mesmo sem config valida (cai pra AP via watchdog)
+  -r       reseta config para placeholder e sobe AP agora
+EOF
+        [ "$1" = "-h" ] || [ "$1" = "--help" ] && exit 0
+        exit 1
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Fluxo principal
+# ---------------------------------------------------------------------------
+
+post_action="go"   # "go" = subir client; "stay" = manter no AP
+
+# Curto-circuito: ja em modo Client + sem flags = no-op (so reporta status e
+# garante watchdog vivo). Evita o bug de re-inicializar wpa_supplicant que
+# zera o IP atual e cria conflito de instancias.
+if [ "$setup" -eq 0 ] && [ "$force" -eq 0 ] && \
+   [ "$(wifi_current_mode)" = "client" ]; then
+    if wifi_client_associated; then
+        ssid=$(wpa_cli -i $WIFI_IFACE status 2>/dev/null | awk -F= '$1=="ssid"{print $2}')
+        ip=$(ip -4 addr show dev $WIFI_IFACE 2>/dev/null | awk '/inet /{print $2; exit}')
+        echo "[wifi-client] ja em modo Client. SSID=${ssid:-?} IP=${ip:-(sem IP)}"
+    else
+        echo "[wifi-client] ja em modo Client, sem associacao (watchdog cuida)."
+    fi
+    # Garante watchdog vivo (cobre caso de o watchdog ter morrido sozinho).
+    if [ -f "$WATCHDOG_PIDFILE" ] && kill -0 "$(cat $WATCHDOG_PIDFILE)" 2>/dev/null; then
+        :
+    else
+        rm -f "$WATCHDOG_PIDFILE"
+        setsid /mnt/system/wifi-watchdog </dev/null >/dev/null 2>&1 &
+        echo "[wifi-client] watchdog reiniciado."
+    fi
+    echo "[wifi-client] use 'wifi-status' para detalhes, 'wifi-ap && wifi-client' para restart."
+    exit 0
+fi
+
+# -s: forca o assistente.
+if [ "$setup" -eq 1 ]; then
+    [ -t 0 ] || { echo "[wifi-client] -s exige TTY interativo." >&2; exit 1; }
+    post_action=$(_run_setup_wizard) || exit 1
+
+# Sem -s + config invalida: oferece assistente (TTY) ou alerta (sem TTY).
+elif ! wifi_client_config_ok; then
+    if [ "$force" -eq 1 ]; then
+        echo "[wifi-client] --force: subindo mesmo sem config valida..."
+    elif [ -t 0 ]; then
+        echo "[wifi-client] config invalida em $WPA_SUPPLICANT_CONF."
+        printf "Rodar o assistente agora? [s/N] "
+        read ans
+        case "$ans" in
+            s|S|sim|Sim|y|Y|yes) post_action=$(_run_setup_wizard) || exit 1 ;;
+            *)
+                echo "[wifi-client] cancelado. Edite o conf ou rode 'wifi-client -s'." >&2
+                exit 1 ;;
+        esac
+    else
+        cat >&2 <<EOF
+[wifi-client] AVISO: config invalida em $WPA_SUPPLICANT_CONF.
+  Causas: ausente, sem network={...}, ou placeholder (ssid="SSID"/psk="PASSWORD").
+  Rode 'wifi-client -s' (TTY) para o assistente, ou edite manualmente.
+EOF
+        exit 1
+    fi
+fi
+
+# Wizard pode ter pedido para apenas salvar (mantem AP).
+if [ "$post_action" = "stay" ]; then
+    wifi_start_ap
+    echo "[wifi-client] config salva; mantendo AP. Use 'wifi-client' para conectar."
+    exit 0
+fi
+
+wifi_stop_watchdog
+if ! wifi_start_client; then
+    echo "[wifi-client] start_client falhou; voltando p/ AP." >&2
+    wifi_start_ap
+    exit 1
+fi
+
+setsid /mnt/system/wifi-watchdog </dev/null >/dev/null 2>&1 &
+echo "[wifi-client] modo Client iniciado; watchdog ativo (cai p/ AP se falhar)."

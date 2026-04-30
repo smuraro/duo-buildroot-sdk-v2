@@ -1,0 +1,72 @@
+#!/bin/sh
+# wifi-watchdog: supervisiona o modo Client e cai pra AP em caso de falha.
+#
+# Janelas (sobrescrevíveis em /mnt/data/wifi.conf):
+#   CLIENT_CONNECT_TIMEOUT  : segundos para a 1a associação após start.
+#                             Sem associação nesse tempo → fallback AP.
+#   CLIENT_DISCONNECT_GRACE : segundos que toleramos desassociação após
+#                             ter conectado uma vez (cobre roaming/reboot
+#                             do AP do usuário) antes de cair pra AP.
+#
+# Lock via pidfile: só uma instância.
+
+. /mnt/system/wifi-lib.sh
+
+wifi_load_overrides
+
+# Single-instance via pidfile.
+if [ -f "$WATCHDOG_PIDFILE" ]; then
+    old=$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)
+    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+        wifi_log "watchdog ja rodando (pid $old) — saindo"
+        exit 0
+    fi
+fi
+echo $$ > "$WATCHDOG_PIDFILE"
+trap 'rm -f "$WATCHDOG_PIDFILE"' EXIT INT TERM
+
+fallback_to_ap() {
+    reason="$1"
+    wifi_log "watchdog: fallback p/ AP ($reason)"
+    wifi_stop_client
+    wifi_start_ap
+    exit 0
+}
+
+# Fase 1: aguarda primeira associação.
+wifi_log "watchdog: aguardando associacao (timeout=${CLIENT_CONNECT_TIMEOUT}s)"
+elapsed=0
+while [ $elapsed -lt "$CLIENT_CONNECT_TIMEOUT" ]; do
+    [ "$(wifi_current_mode)" = "client" ] || {
+        wifi_log "watchdog: modo mudou para $(wifi_current_mode), saindo"
+        exit 0
+    }
+    if wifi_client_associated && wifi_client_has_ip; then
+        wifi_log "watchdog: associado + IP atribuido"
+        break
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+done
+
+if ! wifi_client_associated || ! wifi_client_has_ip; then
+    fallback_to_ap "nao associou em ${CLIENT_CONNECT_TIMEOUT}s"
+fi
+
+# Fase 2: monitora; se cair por > grace, fallback.
+disconnected_for=0
+while :; do
+    [ "$(wifi_current_mode)" = "client" ] || {
+        wifi_log "watchdog: modo mudou para $(wifi_current_mode), saindo"
+        exit 0
+    }
+    if wifi_client_associated && wifi_client_has_ip; then
+        disconnected_for=0
+    else
+        disconnected_for=$((disconnected_for + 10))
+        if [ $disconnected_for -ge "$CLIENT_DISCONNECT_GRACE" ]; then
+            fallback_to_ap "desconectado por ${disconnected_for}s"
+        fi
+    fi
+    sleep 10
+done

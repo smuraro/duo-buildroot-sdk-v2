@@ -1,0 +1,81 @@
+#!/bin/sh
+# wifi-status: snapshot do estado atual do Wi-Fi.
+
+. /mnt/system/wifi-lib.sh
+
+wifi_load_overrides
+mode=$(wifi_current_mode)
+suffix=$(wifi_unique_suffix)
+
+echo "interface : $WIFI_IFACE"
+echo "modo      : $mode"
+echo "MAC       : $(cat /sys/class/net/$WIFI_IFACE/address 2>/dev/null || echo '?')"
+echo "SSID-tag  : $suffix"
+echo
+
+case "$mode" in
+    ap)
+        echo "AP SSID   : ${AP_SSID_PREFIX}-${suffix}"
+        echo "AP IP     : $AP_IP"
+        if [ -f "$HOSTAPD_PIDFILE" ] && kill -0 "$(cat $HOSTAPD_PIDFILE)" 2>/dev/null; then
+            echo "hostapd   : running (pid $(cat $HOSTAPD_PIDFILE))"
+        else
+            echo "hostapd   : NAO RODANDO (pidfile $HOSTAPD_PIDFILE)"
+        fi
+        # aic8800 nao publica stations via nl80211; preferimos hostapd_cli.
+        # Cada linha de `all_sta` que comeca com par hex:par hex eh um MAC.
+        macs=$(hostapd_cli -p /var/run/hostapd -i $WIFI_IFACE all_sta 2>/dev/null \
+               | awk '/^[0-9a-fA-F][0-9a-fA-F]:/{print}')
+        src="hostapd_cli"
+        if [ -z "$macs" ]; then
+            # Fallback: leases do dnsmasq filtrados pelo subnet do AP.
+            # Util quando o hostapd ainda nao tem ctrl_interface (instancia antiga)
+            # ou quando o socket de controle nao esta acessivel. Leases tem TTL
+            # entao podem incluir clientes que desassociaram recentemente.
+            ap_prefix="${AP_IP%.*}."
+            macs=$(awk -v p="$ap_prefix" '$3 ~ "^"p {print $2}' \
+                   /var/lib/misc/dnsmasq.leases 2>/dev/null)
+            src="dnsmasq.leases (TTL — pode incluir desassociados)"
+        fi
+        n=$(echo "$macs" | grep -c .)
+        echo "clientes  : $n  [fonte: $src]"
+        if [ -n "$macs" ]; then
+            for m in $macs; do
+                lease=$(awk -v mac="$m" 'tolower($2)==tolower(mac){print $3" "$4}' \
+                        /var/lib/misc/dnsmasq.leases 2>/dev/null)
+                echo "            $m  ${lease:-(sem lease DHCP)}"
+            done
+        fi
+        ;;
+    client)
+        if wifi_client_associated; then
+            ssid=$(wpa_cli -i $WIFI_IFACE status 2>/dev/null | awk -F= '$1=="ssid"{print $2}')
+            bssid=$(wpa_cli -i $WIFI_IFACE status 2>/dev/null | awk -F= '$1=="bssid"{print $2}')
+            ip=$(ip -4 addr show dev $WIFI_IFACE 2>/dev/null | awk '/inet /{print $2}')
+            echo "estado    : ASSOCIADO"
+            echo "SSID      : $ssid"
+            echo "BSSID     : $bssid"
+            echo "IP        : ${ip:-(sem IP)}"
+        else
+            echo "estado    : NAO ASSOCIADO (watchdog fara fallback p/ AP)"
+        fi
+        if [ -f "$WATCHDOG_PIDFILE" ] && kill -0 "$(cat $WATCHDOG_PIDFILE)" 2>/dev/null; then
+            echo "watchdog  : running (pid $(cat $WATCHDOG_PIDFILE))"
+        else
+            echo "watchdog  : nao rodando"
+        fi
+        ;;
+    *)
+        echo "(sem modo Wi-Fi ativo)"
+        ;;
+esac
+
+echo
+if wifi_client_config_ok; then
+    echo "config cliente : $WPA_SUPPLICANT_CONF VALIDA (boot tentara Client)"
+elif [ -f "$WPA_SUPPLICANT_CONF" ]; then
+    echo "config cliente : $WPA_SUPPLICANT_CONF presente mas INVALIDA / placeholder"
+    echo "                 (boot subira AP ate ssid/psk serem editados)"
+else
+    echo "config cliente : ausente (boot subira AP)"
+fi
