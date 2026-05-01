@@ -290,6 +290,46 @@ CVI_S32 SAMPLE_COMM_GetSnsI2cInfo(const ISP_SNS_OBJ_S *pstSnsObj, SAMPLE_SNS_TYP
 			stSnsI2cInfo->sns_resume_info[i].data = resumedData[i];
 		}
 		return CVI_SUCCESS;
+	case GCORE_GC2083_MIPI_2M_30FPS_10BIT:
+		/* Sequencia identica ao gc2083_standby/gc2083_restart em
+		 * cvi_mpi/component/isp/sensor/sg200x/gcore_gc2083/gc2083_sensor_ctl.c.
+		 * Diferente do GC2053: GC2083 usa registradores de 16 bits (addr_bytes=2)
+		 * e dados de 8 bits. No Milkv Duo S, sensor responde em /dev/i2c-3 0x37
+		 * (validado via i2cdetect com pipeline rodando).
+		 */
+		stSnsI2cInfo->i2c_base_info.i2c_dev = 3;
+		stSnsI2cInfo->i2c_base_info.dev_addr = 0x37;
+		stSnsI2cInfo->i2c_base_info.addr_bytes = 2;
+		stSnsI2cInfo->i2c_base_info.data_bytes = 1;
+		stSnsI2cInfo->i2c_base_info.suspend_seq_length = 4;
+		stSnsI2cInfo->i2c_base_info.resume_seq_length = 4;
+
+		suspendAddr[0] = 0x003e;
+		suspendData[0] = 0x00;
+		suspendAddr[1] = 0x03f7;
+		suspendData[1] = 0x00;
+		suspendAddr[2] = 0x03fc;
+		suspendData[2] = 0x01;
+		suspendAddr[3] = 0x03f9;
+		suspendData[3] = 0x41;
+		for (i = 0; i < stSnsI2cInfo->i2c_base_info.suspend_seq_length; i++) {
+			stSnsI2cInfo->sns_suspend_info[i].addr = suspendAddr[i];
+			stSnsI2cInfo->sns_suspend_info[i].data = suspendData[i];
+		}
+
+		resumedAddr[0] = 0x03f9;
+		resumedData[0] = 0x42;
+		resumedAddr[1] = 0x03f7;
+		resumedData[1] = 0x11;
+		resumedAddr[2] = 0x03fc;
+		resumedData[2] = 0x8e;
+		resumedAddr[3] = 0x003e;
+		resumedData[3] = 0x91;
+		for (i = 0; i < stSnsI2cInfo->i2c_base_info.resume_seq_length; i++) {
+			stSnsI2cInfo->sns_resume_info[i].addr = resumedAddr[i];
+			stSnsI2cInfo->sns_resume_info[i].data = resumedData[i];
+		}
+		return CVI_SUCCESS;
 	case GCORE_GC4653_MIPI_4M_30FPS_10BIT:
 		stSnsI2cInfo->i2c_base_info.i2c_dev = 2;
 		stSnsI2cInfo->i2c_base_info.dev_addr = 0x29;
