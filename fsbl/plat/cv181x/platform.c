@@ -444,8 +444,123 @@ static void *get_warmboot_entry(void)
 	NOTICE("\nREG_RTC_ST_ON_REASON=0x%x\n", mmio_read_32(REG_RTC_ST_ON_REASON));
 	NOTICE("\nRTC_SRAM_FLAG_ADDR%x=0x%x\n", RTC_SRAM_FLAG_ADDR, mmio_read_32(RTC_SRAM_FLAG_ADDR));
 	/* Check if RTC state changed from ST_SUSP */
-	if ((mmio_read_32(REG_RTC_ST_ON_REASON) & 0xF) == WANTED_STATE)
+	if ((mmio_read_32(REG_RTC_ST_ON_REASON) & 0xF) == WANTED_STATE) {
+		/*
+		 * PROBE FSBL hook viability — kept active during initial deployment.
+		 * Reads non-AON GPIO state at FSBL stage; values printed below.
+		 * Phase A: state inherited from suspend. Phase B: after rtc_set_rmio_pwrok.
+		 * Empirically (validated 2026-05-01): ext0 reflects pin level correctly in
+		 * BOTH phases; pinmux preserved (fmux=0x3); RMIO bit not required for read.
+		 * To remove probe later: delete the two NOTICE("PROBE_*"...) blocks below
+		 * and the rmio_pwrok setbits line.
+		 */
+		volatile int __delay_i;
+		NOTICE("PROBE_A: pg=0x%x ext0=0x%x ext1=0x%x ddr=0x%x fmux_b14=0x%x\n",
+		       mmio_read_32(REG_RTC_BASE + RTC_PG_REG),
+		       mmio_read_32(0x03021050),
+		       mmio_read_32(0x03021054),
+		       mmio_read_32(0x03021010),
+		       mmio_read_32(0x03001140));
+		mmio_setbits_32(REG_RTC_BASE + RTC_PG_REG, 0x00000002); /* rtc_set_rmio_pwrok */
+		for (__delay_i = 0; __delay_i < 10000; __delay_i++)
+			;
+		NOTICE("PROBE_B: pg=0x%x ext0=0x%x ext1=0x%x ddr=0x%x fmux_b14=0x%x\n",
+		       mmio_read_32(REG_RTC_BASE + RTC_PG_REG),
+		       mmio_read_32(0x03021050),
+		       mmio_read_32(0x03021054),
+		       mmio_read_32(0x03021010),
+		       mmio_read_32(0x03001140));
+
+		/*
+		 * === FSBL polled-wake hook ===
+		 * If userspace wrote the magic at POLLED_WAKE_CFG_BASE before suspend,
+		 * read GPIO state and decide: match/timeout/cap → continue resume; else
+		 * re-arm RTC alarm and re-suspend (rtc_req_suspend inlined since the
+		 * library version lives in .suspend_func linker section, not callable
+		 * from FSBL platform.c).
+		 *
+		 * SRAM layout (8 x u32 = 32 bytes at 0x05026F00):
+		 *   +0x00 magic       0x504F4C45 ('POLE')
+		 *   +0x04 gpio_addr   absolute MMIO addr of EXT_PORT (e.g. 0x03021050)
+		 *   +0x08 bit_mask    e.g. 0x4000 for portb pin 14
+		 *   +0x0C wake_value  0 or bit_mask (already masked target)
+		 *   +0x10 alarm_sec   re-arm interval per iter
+		 *   +0x14 timeout_sec max wall time in loop (0 = no time-based timeout)
+		 *   +0x18 start_sec   RTC seconds when loop started (set by userspace)
+		 *   +0x1C iter_count  incremented by FSBL each false-wake (capped at 10000)
+		 */
+#define POLLED_WAKE_CFG_BASE 0x05026F00
+#define POLLED_WAKE_MAGIC    0x504F4C45  /* 'POLE' */
+#define POLLED_WAKE_HARD_CAP 10000
+
+		if (mmio_read_32(POLLED_WAKE_CFG_BASE) == POLLED_WAKE_MAGIC) {
+			uint32_t gpio_addr = mmio_read_32(POLLED_WAKE_CFG_BASE + 0x04);
+			uint32_t bit_mask  = mmio_read_32(POLLED_WAKE_CFG_BASE + 0x08);
+			uint32_t wake_val  = mmio_read_32(POLLED_WAKE_CFG_BASE + 0x0C);
+			uint32_t alarm_s   = mmio_read_32(POLLED_WAKE_CFG_BASE + 0x10);
+			uint32_t timeout_s = mmio_read_32(POLLED_WAKE_CFG_BASE + 0x14);
+			uint32_t start_s   = mmio_read_32(POLLED_WAKE_CFG_BASE + 0x18);
+			uint32_t iter      = mmio_read_32(POLLED_WAKE_CFG_BASE + 0x1C);
+			uint32_t now_s     = mmio_read_32(REG_RTC_BASE + 0x18); /* RTC_SEC_CNTR_VALUE */
+			uint32_t cur_masked    = mmio_read_32(gpio_addr) & bit_mask;
+			uint32_t target_masked = wake_val & bit_mask;
+			const char *exit_reason = (void *)0;
+
+			NOTICE("[FSBL hook] iter=%u gpio[0x%x]=0x%x mask=0x%x tgt=0x%x now=%u start=%u\n",
+			       iter, gpio_addr, cur_masked, bit_mask, target_masked, now_s, start_s);
+
+			if (cur_masked == target_masked)
+				exit_reason = "match";
+			else if (timeout_s > 0 && (now_s - start_s) >= timeout_s)
+				exit_reason = "timeout";
+			else if (iter >= POLLED_WAKE_HARD_CAP)
+				exit_reason = "hard-cap";
+
+			if (exit_reason) {
+				NOTICE("[FSBL hook] exit: %s after %u iter(s)\n", exit_reason, iter);
+				mmio_write_32(POLLED_WAKE_CFG_BASE, 0); /* clear magic */
+				return (void *)(uintptr_t)mmio_read_32(RTC_SRAM_FLAG_ADDR);
+			}
+
+			/* No match, no timeout, no cap → re-arm and re-suspend */
+			mmio_write_32(POLLED_WAKE_CFG_BASE + 0x1C, iter + 1);
+
+			/*
+			 * Re-arm RTC alarm following the cvi_rtc.c kernel sequence:
+			 *   disable → wait → set time → prdata_sel → enable
+			 * Sem disable/wait inicial, escrita em ALARM_TIME e ignorada e
+			 * o silicio dispara o alarm imediatamente apos req_suspend,
+			 * dando intervalos ~2s em vez do alarm_s configurado.
+			 */
+			mmio_write_32(REG_RTC_BASE + 0x0C, 0x0);             /* RTC_ALARM_ENABLE = 0 */
+			for (__delay_i = 0; __delay_i < 20000; __delay_i++)
+				; /* ~rough 200us settle */
+			mmio_write_32(REG_RTC_BASE + 0x08, now_s + alarm_s); /* RTC_ALARM_TIME */
+			mmio_write_32(REG_RTC_BASE + 0x3C, 0x1);             /* prdata sel from 32K */
+			mmio_write_32(REG_RTC_BASE + 0x0C, 0x1);             /* RTC_ALARM_ENABLE = 1 */
+
+			/* Ensure wake source mask retains alarm bit (bit 5) */
+			mmio_setbits_32(REG_RTC_BASE + RTC_EN_PWR_WAKEUP, 0x30);
+
+			/*
+			 * Inline rtc_req_suspend (does not return). DDR stays in
+			 * self-refresh from the previous suspend; FSM handles power
+			 * gating via DN_SEQ registers when transitioning to ST_SUSP.
+			 */
+			mmio_write_32(REG_RTC_CTRL_BASE + RTC_CTRL0_UNLOCKKEY, 0xAB18);
+			mmio_write_32(REG_RTC_BASE + RTC_EN_SUSPEND_REQ, 0x01);
+			while (mmio_read_32(REG_RTC_BASE + RTC_EN_SUSPEND_REQ) != 0x01)
+				;
+			while (1) {
+				for (__delay_i = 0; __delay_i < 10000; __delay_i++)
+					; /* ~rough 1ms delay */
+				mmio_write_32(REG_RTC_CTRL_BASE + RTC_CTRL0, 0x00800080);
+			}
+			/* unreachable */
+		}
+
 		return (void *)(uintptr_t)mmio_read_32(RTC_SRAM_FLAG_ADDR);
+	}
 
 	return 0;
 }

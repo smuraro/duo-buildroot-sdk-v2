@@ -35,7 +35,13 @@
 #   Detalhes em memory/project_milkv_duos_poweroff.md.
 #
 #   --pin contorna isso via polled wake: RTC alarm acorda periodicamente,
-#   userspace le GPIO, decide continuar dormindo ou sair do loop.
+#   FSBL hook le GPIO no estagio inicial do warmboot e decide continuar
+#   dormindo (sem ddr_resume + kernel resume) ou sair do loop.
+#   Userspace grava config no RTC SRAM (0x05026F00) antes do echo mem.
+#   FSBL hook em fsbl/plat/cv181x/platform.c:get_warmboot_entry valida magic
+#   ('POLE'), le GPIO, re-arma alarm e chama rtc_req_suspend se nao matched.
+#   Ganho: ~30x menos energia por wake-falso (~50ms vs ~2s do loop userspace).
+#
 #   Pull-up/pull-down nao e configuravel pelo script (kernel pinctrl-cv181x
 #   nao expoe pinconf). Use pull externo na placa ou pino driven pela fonte.
 
@@ -53,6 +59,27 @@ RTC_CTRL0_UNLOCK=0x05025004
 RTC_EN_SUSPEND_REQ=0x050260E4
 RTC_CTRL0=0x05025008
 RTC_CTRL0_REQ_SUSPEND=0x00800080
+
+# FSBL polled-wake hook: comunicacao kernel->FSBL via RTC SRAM.
+# Layout (8 x u32 a partir de 0x05026F00, dentro do range livre 0x05026800-FEF):
+#   +0x00 magic       0x504F4C45 ('POLE')
+#   +0x04 gpio_addr   absoluto, ex 0x03021050 (portb EXT_PORT)
+#   +0x08 bit_mask    ex 0x4000
+#   +0x0C wake_value  0 ou bit_mask (alvo ja mascarado)
+#   +0x10 alarm_sec
+#   +0x14 timeout_sec (0 = sem timeout)
+#   +0x18 start_sec   (RTC seconds quando comecou)
+#   +0x1C iter_count  (incrementado pelo FSBL)
+# FSBL hook esta em fsbl/plat/cv181x/platform.c:get_warmboot_entry.
+PWHOOK_MAGIC_ADDR=0x05026F00
+PWHOOK_MAGIC_VAL=0x504F4C45
+PWHOOK_GPIO_ADDR=0x05026F04
+PWHOOK_BIT_MASK=0x05026F08
+PWHOOK_WAKE_VAL=0x05026F0C
+PWHOOK_ALARM=0x05026F10
+PWHOOK_TIMEOUT=0x05026F14
+PWHOOK_START=0x05026F18
+PWHOOK_ITER=0x05026F1C
 
 # Header position -> sysfs gpio (Duo S). Fonte:
 # device/generic/rootfs_overlay/duos/usr/lib/python3.12/site-packages/pinpong/extension/milkvDuo.py
@@ -112,6 +139,48 @@ resolve_bank_base() {
         esac
     done
     return 1
+}
+
+# Resolve letra A-E para endereco MMIO do EXT_PORT do banco.
+# Empirico (validado 2026-05-01 via FSBL probe): cv181x usa SEMPRE slot idx=0
+# do dwapb (offset 0x50), mesmo quando dts diz gpio-controller@N. Resultado:
+#   porta -> 0x03020050   portb -> 0x03021050   portc -> 0x03022050
+#   portd -> 0x03023050   porte -> 0x05021050
+resolve_bank_ext_port_addr() {
+    case "$1" in
+        a|A) echo 0x03020050 ;;
+        b|B) echo 0x03021050 ;;
+        c|C) echo 0x03022050 ;;
+        d|D) echo 0x03023050 ;;
+        e|E) echo 0x05021050 ;;
+        *)   return 1 ;;
+    esac
+}
+
+# Resolve --pin SPEC para par "gpio_ext_port_addr bit_offset" (espaco-separado).
+# Usado pra escrever a config do FSBL hook no RTC SRAM.
+# Usa bases hardcoded (validadas pelo duo-init.sh: gpio_b17=465=448+17,
+# host_wake_bt=362=352+10). Range de cada banco: 32 pinos.
+#   porta=480..511 (0x03020050)   portb=448..479 (0x03021050)
+#   portc=416..447 (0x03022050)   portd=384..415 (0x03023050)
+#   porte=352..383 (0x05021050)
+resolve_pin_to_addr_bit() {
+    local sysfs bit_offset bank_addr
+    sysfs=$(resolve_pin_to_sysfs "$1") || return 1
+    if   [ "$sysfs" -ge 480 ] && [ "$sysfs" -le 511 ]; then
+        bit_offset=$((sysfs - 480)); bank_addr=0x03020050
+    elif [ "$sysfs" -ge 448 ] && [ "$sysfs" -le 479 ]; then
+        bit_offset=$((sysfs - 448)); bank_addr=0x03021050
+    elif [ "$sysfs" -ge 416 ] && [ "$sysfs" -le 447 ]; then
+        bit_offset=$((sysfs - 416)); bank_addr=0x03022050
+    elif [ "$sysfs" -ge 384 ] && [ "$sysfs" -le 415 ]; then
+        bit_offset=$((sysfs - 384)); bank_addr=0x03023050
+    elif [ "$sysfs" -ge 352 ] && [ "$sysfs" -le 383 ]; then
+        bit_offset=$((sysfs - 352)); bank_addr=0x05021050
+    else
+        return 1
+    fi
+    echo "$bank_addr $bit_offset"
 }
 
 # Resolve --pin SPEC para numero sysfs absoluto. Detecta formato pelo prefixo.
@@ -218,9 +287,11 @@ restore_wifi() {
     fi
 }
 
-# SIGINT/SIGTERM: restaura wifi e desexporta GPIO antes de sair.
+# SIGINT/SIGTERM: restaura wifi, desexporta GPIO e limpa magic do FSBL hook
+# (defensivo — magic stale poderia disparar hook na proxima invocacao sem --pin).
 cleanup_and_exit() {
     local rc=${1:-0}
+    devmem $PWHOOK_MAGIC_ADDR 32 0x00000000 2>/dev/null
     if [ -n "$GPIO_EXPORTED_BY_US" ]; then
         echo "$GPIO_EXPORTED_BY_US" > /sys/class/gpio/unexport 2>/dev/null
     fi
@@ -328,50 +399,73 @@ if [ -e /sys/power/state ] && grep -q mem /sys/power/state 2>/dev/null; then
             echo "[suspend] cheque dmesg | tail pra ver qual driver"
         fi
     else
-        # --- polling loop (--pin) ---
-        START_TIME=$(date +%s)
-        ITER=0
-        EXIT_REASON=""
-        while true; do
-            ITER=$((ITER + 1))
+        # --- FSBL polled-wake hook (--pin): userspace escreve config no
+        #     RTC SRAM e chama echo mem 1x; FSBL faz o loop internamente.
+        #     Ganho ~30x em consumo por wake-falso (50ms vs 2s do loop userspace),
+        #     e elimina spam de log do kernel resume + drivers a cada iteracao.
+        ADDR_BIT=$(resolve_pin_to_addr_bit "$PIN_SPEC") || {
+            echo "[wake-on-pin] ERRO: nao foi possivel resolver --pin '$PIN_SPEC' pra (addr,bit)" >&2
+            cleanup_and_exit 1
+        }
+        GPIO_ADDR=$(echo "$ADDR_BIT" | cut -d' ' -f1)
+        BIT_OFFSET=$(echo "$ADDR_BIT" | cut -d' ' -f2)
+        BIT_MASK=$((1 << BIT_OFFSET))
+        WAKE_VAL_BITS=0
+        [ "$WAKE_VAL" = "1" ] && WAKE_VAL_BITS=$BIT_MASK
+        BIT_MASK_HEX=$(printf '0x%08x' "$BIT_MASK")
+        WAKE_VAL_HEX=$(printf '0x%08x' "$WAKE_VAL_BITS")
 
-            # Re-arma alarm a cada iteracao (alarm e one-shot).
-            echo 0 > /sys/class/rtc/rtc0/wakealarm 2>/dev/null
-            if ! echo "+${ALARM_SEC}" > /sys/class/rtc/rtc0/wakealarm; then
-                echo "[wake-on-pin] iter=$ITER ERRO: falha ao re-armar wakealarm" >&2
-                EXIT_REASON="wakealarm-fail"
-                break
-            fi
+        START_SEC=$(cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null || date +%s)
 
-            sync
-            if ! echo mem > /sys/power/state; then
-                echo "[wake-on-pin] iter=$ITER ERRO: echo mem falhou" >&2
-                EXIT_REASON="suspend-fail"
-                break
-            fi
-            # FSBL warmboot limpa bit 2 do EN_PWR_VBAT_DET — restaura aqui
-            # pra manter o pino fisico de reset funcional entre iteracoes.
-            devmem 0x050260D0 32 0x00000007 2>/dev/null
+        # Grava config no SRAM. FSBL hook le no get_warmboot_entry e age.
+        devmem $PWHOOK_GPIO_ADDR 32 "$GPIO_ADDR"
+        devmem $PWHOOK_BIT_MASK  32 "$BIT_MASK_HEX"
+        devmem $PWHOOK_WAKE_VAL  32 "$WAKE_VAL_HEX"
+        devmem $PWHOOK_ALARM     32 "$ALARM_SEC"
+        devmem $PWHOOK_TIMEOUT   32 "$TIMEOUT_SEC"
+        devmem $PWHOOK_START     32 "$START_SEC"
+        devmem $PWHOOK_ITER      32 0
+        # Magic POR ULTIMO — so depois que tudo esta consistente.
+        devmem $PWHOOK_MAGIC_ADDR 32 $PWHOOK_MAGIC_VAL
 
-            PIN_VAL=$(read_gpio_debounced "$SYSFS_PIN")
+        echo "[wake-on-pin] FSBL hook armado: addr=$GPIO_ADDR mask=$BIT_MASK_HEX target=$WAKE_VAL_HEX alarm=${ALARM_SEC}s timeout=${TIMEOUT_SEC}s"
 
-            if [ "$PIN_VAL" = "$WAKE_VAL" ]; then
-                echo "[wake-on-pin] iter=$ITER pino=$PIN_VAL bate (esperado=$WAKE_VAL), saindo"
-                EXIT_REASON="match"
-                break
-            fi
+        # Alarm inicial — FSBL re-arma a cada iter falsa.
+        echo 0 > /sys/class/rtc/rtc0/wakealarm 2>/dev/null
+        if ! echo "+${ALARM_SEC}" > /sys/class/rtc/rtc0/wakealarm; then
+            echo "[wake-on-pin] ERRO: falha ao armar wakealarm inicial" >&2
+            devmem $PWHOOK_MAGIC_ADDR 32 0x00000000
+            cleanup_and_exit 1
+        fi
 
-            if [ "$TIMEOUT_SEC" -gt 0 ]; then
-                NOW=$(date +%s)
-                ELAPSED=$((NOW - START_TIME))
-                if [ "$ELAPSED" -ge "$TIMEOUT_SEC" ]; then
-                    echo "[wake-on-pin] iter=$ITER timeout ${TIMEOUT_SEC}s atingido (pino=$PIN_VAL, esperado=$WAKE_VAL), saindo"
-                    EXIT_REASON="timeout"
-                    break
-                fi
-            fi
-        done
-        echo "[wake-on-pin] terminou: $EXIT_REASON apos $ITER iter(s)"
+        sync
+        if ! echo mem > /sys/power/state; then
+            echo "[wake-on-pin] ERRO: echo mem falhou" >&2
+            devmem $PWHOOK_MAGIC_ADDR 32 0x00000000
+            cleanup_and_exit 1
+        fi
+
+        # FSBL retornou — significa que ele decidiu sair do loop (match,
+        # timeout, hard-cap, ou hook nao ativo se firmware antigo).
+        # Restaura bit 2 do EN_PWR_VBAT_DET (FSBL warmboot zera, quebrando
+        # o pino fisico de reset; restaurar em ST_ON nao causa power-up).
+        devmem 0x050260D0 32 0x00000007 2>/dev/null
+
+        # devmem retorna em hex (0x...). Converte pra decimal pra UX.
+        ITER_HEX=$(devmem $PWHOOK_ITER 32 2>/dev/null)
+        ITER=$(printf '%d' "$ITER_HEX" 2>/dev/null || echo 0)
+        PIN_VAL=$(read_gpio_debounced "$SYSFS_PIN")
+        # Limpa magic defensivamente (FSBL ja limpa em saida normal, mas
+        # se hook nao estava ativo o magic ficaria stale).
+        devmem $PWHOOK_MAGIC_ADDR 32 0x00000000
+
+        if [ "$PIN_VAL" = "$WAKE_VAL" ]; then
+            echo "[wake-on-pin] FSBL exit: match apos $ITER iter(s) falsas, pino=$PIN_VAL"
+        elif [ "$ITER" = "0" ]; then
+            echo "[wake-on-pin] FSBL hook NAO ativou (iter=0) — firmware sem suporte? Saiu apos 1 ciclo, pino=$PIN_VAL"
+        else
+            echo "[wake-on-pin] FSBL exit: timeout ou hard-cap apos $ITER iter(s) falsas, pino=$PIN_VAL (esperado=$WAKE_VAL)"
+        fi
     fi
 
     restore_wifi
