@@ -1,45 +1,67 @@
 #!/bin/sh
 #
-# node-red-services.sh - Start or stop Node-RED / SSCMA services and
+# node-red-services.sh - Start/stop Node-RED / SSCMA services and
 #                        enable/disable them across reboots.
 #
 # Usage: node-red-services.sh {start|stop}
 #
-#   start : enables and starts  S03node-red, S91sscma-node, S93sscma-supervisor
-#   stop  : disables and stops  S03node-red, S91sscma-node, S93sscma-supervisor
+#   start : enables (renames K* -> S*) and starts the services
+#   stop  : stops and disables (renames S* -> K*) the services
 #
-# "Enable/disable across reboots" is done by toggling the executable bit
-# on the init.d scripts. BusyBox rcS only runs scripts that are executable.
+# Enable/disable persists by renaming the leading letter of the init
+# script: BusyBox rcS only iterates /etc/init.d/S??* (start), and rcK
+# iterates the same pattern with "stop". A K-prefixed file is invisible
+# to both -- which is exactly what we want for a disabled service.
+# (Note: K here is just a "disabled" marker; rcK does NOT auto-run K*.)
 #
 
 INITD="/etc/init.d"
-SERVICES="S03node-red S91sscma-node S93sscma-supervisor"
+# Order matters: services are listed in start-order. stop walks them in
+# reverse so dependents go down before what they depend on.
+SERVICES="03node-red 91sscma-node 93sscma-supervisor"
+
+# Locate the script regardless of S/K prefix. Echoes the full path or
+# nothing if neither exists.
+find_script() {
+    for prefix in S K; do
+        if [ -f "$INITD/$prefix$1" ]; then
+            echo "$INITD/$prefix$1"
+            return
+        fi
+    done
+}
 
 case "$1" in
   start)
     echo "Enabling and starting Node-RED / SSCMA services..."
     for svc in $SERVICES; do
-      script="$INITD/$svc"
-      if [ -f "$script" ]; then
-        chmod +x "$script"
+        script=$(find_script "$svc")
+        if [ -z "$script" ]; then
+            echo "  WARNING: neither S$svc nor K$svc found, skipping."
+            continue
+        fi
+        case "$script" in
+            */K*) mv "$script" "$INITD/S$svc"; script="$INITD/S$svc" ;;
+        esac
         "$script" start
-      else
-        echo "  WARNING: $script not found, skipping."
-      fi
     done
     echo "Done."
     ;;
 
   stop)
     echo "Stopping and disabling Node-RED / SSCMA services..."
-    for svc in $SERVICES; do
-      script="$INITD/$svc"
-      if [ -f "$script" ]; then
+    REVERSED=""
+    for svc in $SERVICES; do REVERSED="$svc $REVERSED"; done
+    for svc in $REVERSED; do
+        script=$(find_script "$svc")
+        if [ -z "$script" ]; then
+            echo "  WARNING: neither S$svc nor K$svc found, skipping."
+            continue
+        fi
         "$script" stop
-        chmod -x "$script"
-      else
-        echo "  WARNING: $script not found, skipping."
-      fi
+        case "$script" in
+            */S*) mv "$script" "$INITD/K$svc" ;;
+        esac
     done
     echo "Done."
     ;;
