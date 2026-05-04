@@ -123,10 +123,15 @@ wifi_render_hostapd_conf() {
     suffix=$(wifi_unique_suffix)
     ssid="${AP_SSID_PREFIX}-${suffix}"
     country=$(wifi_country)
-    # Substitui (ou injeta) ssid=, country_code= e, se AP_PASSPHRASE setado,
-    # wpa_passphrase=. country_code precisa bater com o `iw reg set` do
-    # duo-init.sh — senão hostapd faz COUNTRY_UPDATE pro valor do template,
-    # sobrescrevendo o que o kernel tinha.
+    # hostapd só aceita country codes ISO reais (BR, US, ...). Trata "00"
+    # (world domain do cfg80211) como "sem país" — omite a linha. Sem ela
+    # hostapd não força COUNTRY_UPDATE e respeita o que o kernel tem.
+    [ "$country" = "00" ] && country=""
+
+    # Substitui ssid=, country_code= (se houver country) e, se
+    # AP_PASSPHRASE setado, wpa_passphrase=. country_code definido
+    # precisa bater com o `iw reg set` do duo-init.sh, senão hostapd
+    # sobrescreve o que o kernel tinha via COUNTRY_UPDATE.
     awk -v ssid="$ssid" -v pass="$AP_PASSPHRASE" -v country="$country" '
         BEGIN { saw_ssid=0; saw_pass=0; saw_cc=0 }
         /^[[:space:]]*ssid[[:space:]]*=/        { print "ssid=" ssid; saw_ssid=1; next }
@@ -134,12 +139,15 @@ wifi_render_hostapd_conf() {
             if (pass != "") { print "wpa_passphrase=" pass } else { print }
             saw_pass=1; next
         }
-        /^[[:space:]]*country_code[[:space:]]*=/ { print "country_code=" country; saw_cc=1; next }
+        /^[[:space:]]*country_code[[:space:]]*=/ {
+            if (country != "") print "country_code=" country
+            saw_cc=1; next
+        }
         { print }
         END {
             if (!saw_ssid) print "ssid=" ssid
             if (!saw_pass && pass != "") print "wpa_passphrase=" pass
-            if (!saw_cc) print "country_code=" country
+            if (!saw_cc && country != "") print "country_code=" country
         }
     ' "$HOSTAPD_TEMPLATE" > "$HOSTAPD_RUNTIME"
     wifi_log "AP SSID=$ssid (template=$HOSTAPD_TEMPLATE runtime=$HOSTAPD_RUNTIME)"
