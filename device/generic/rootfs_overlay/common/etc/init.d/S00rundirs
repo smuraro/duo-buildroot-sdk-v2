@@ -1,0 +1,27 @@
+#!/bin/sh
+#
+# S00rundirs - Pre-create runtime directories on /run (tmpfs).
+#
+# /run e seus filhos são tmpfs montados pelo fstab → ficam vazios a cada
+# boot. Vários serviços assumem que subdirs como /run/lock, /run/dbus já
+# existem. Sem isso:
+#
+#   - S30dbus tenta `mkdir -p /var/lock/subsys` (symlink → /run/lock).
+#     Se /run/lock não existe, BusyBox mkdir falha com "File exists" no
+#     symlink dangling, e o subsequente `touch /var/lock/subsys/...`
+#     também falha.
+#   - O mesmo erro aparece no rcK (S30dbus tem o mkdir fora de start()/
+#     stop(), então roda também no shutdown).
+#
+# Roda como S00 pra preceder qualquer outro S?? que dependa dessas dirs.
+#
+
+case "$1" in
+  start)
+    mkdir -p /run/lock/subsys /run/dbus /tmp/dbus
+    ;;
+  stop)
+    ;;
+esac
+
+exit 0

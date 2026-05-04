@@ -23,6 +23,8 @@ case "$1" in
       i=$((i+1))
     done
     [ -b "$DEVICE" ] || exit 0
+    # Já montado? (mdev hotplug pode ter chegado primeiro durante o boot.)
+    mountpoint -q "$MOUNTPOINT" && exit 0
     mkdir -p "$MOUNTPOINT"
     FSTYPE=$(blkid -o value -s TYPE "$DEVICE" 2>/dev/null)
     case "$FSTYPE" in
