@@ -583,6 +583,7 @@ static int eth_post_probe(struct udevice *dev)
 		net_random_ethaddr(pdata->enetaddr);
 		printf("\nWarning: %s (eth%d) using random MAC address - %pM\n",
 		       dev->name, dev_seq(dev), pdata->enetaddr);
+		printf("         Hint: run /mnt/system/setmac.sh in Linux to persist a stable MAC.\n");
 #else
 		printf("\nError: %s address not set.\n",
 		       dev->name);
