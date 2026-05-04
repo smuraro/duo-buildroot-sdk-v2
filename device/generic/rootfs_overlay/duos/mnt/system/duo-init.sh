@@ -28,27 +28,29 @@ set_gpio ${host_wake_bt} 1
 # WIFI/BT Module
 #
 # Country code regulatório:
-#   - Lido de /mnt/data/wifi-country (2 letras, ex: BR, US, JP, DE).
-#   - Default 00 = world domain (regras conservadoras universais).
-#   - Para mudar:  echo BR > /mnt/data/wifi-country  &&  reboot
+#   - Lido de /mnt/data/wifi-country (single source of truth, ver wifi-lib.sh).
+#   - Default 00 = world domain.
+#   - Para mudar:  /mnt/system/setcountry.sh BR  &&  reboot
 #
 # custregd=0 desliga o modo "self-managed" do driver AIC. Sem isso o
 # driver registra rules permissivas próprias e ignora cfg80211 — o que
 # gera o warning "*** USING PERMISSIVE CUSTOM REGULATORY RULES ***" no
 # kernel. Com custregd=0, a regdb (/lib/firmware/regulatory.db, do
 # pacote wireless-regdb) e o `iw reg set` abaixo passam a valer.
-WIFI_COUNTRY=$(cat /mnt/data/wifi-country 2>/dev/null | tr -d '[:space:]' | tr a-z A-Z)
-WIFI_COUNTRY=${WIFI_COUNTRY:-00}
+. /mnt/system/wifi-lib.sh
 
 insmod /mnt/system/ko/aic8800_bsp.ko
 sleep 0.5
 insmod /mnt/system/ko/aic8800_fdrv.ko custregd=0
 sleep 0.5
+# Aplica MAC persistido (se houver) — antes de qualquer cliente da rede
+# ver wlan0. Helper espera o netdev aparecer e faz down/set/up.
+wifi_apply_mac
 # cfg80211 tenta carregar a regdb antes do rootfs montar (~1.8s vs 2.0s)
 # e marca regdb=ERR_PTR(-ENODATA) sem retry. `iw reg reload` força um
 # request_firmware síncrono que substitui o err pointer pelo regdb real.
 iw reg reload 2>/dev/null
-iw reg set "$WIFI_COUNTRY" 2>/dev/null
+iw reg set "$(wifi_country)" 2>/dev/null
 
 # Insmod PWM Module
 insmod /mnt/system/ko/cv181x_pwm.ko

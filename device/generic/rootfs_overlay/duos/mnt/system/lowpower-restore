@@ -92,6 +92,9 @@ restore_wifi() {
     applied wifi || return
     log "wifi: recarregando aic8800 e religando..."
 
+    # shellcheck disable=SC1091
+    . "$SYSTEM_DIR/wifi-lib.sh"
+
     [ -e /sys/class/gpio/gpio362/value ] && \
         echo 1 > /sys/class/gpio/gpio362/value 2>/dev/null
 
@@ -100,9 +103,9 @@ restore_wifi() {
     # custregd=0: ver duo-init.sh
     insmod "$SYSTEM_DIR/ko/aic8800_fdrv.ko" custregd=0 2>/dev/null && log "  insmod aic8800_fdrv"
     sleep 0.5
-    WIFI_COUNTRY=$(cat /mnt/data/wifi-country 2>/dev/null | tr -d '[:space:]' | tr a-z A-Z)
+    wifi_apply_mac
     iw reg reload 2>/dev/null
-    iw reg set "${WIFI_COUNTRY:-00}" 2>/dev/null
+    iw reg set "$(wifi_country)" 2>/dev/null
 
     # Espera wlan0 aparecer (mesmo padrao do duo-init.sh).
     i=0
@@ -112,15 +115,11 @@ restore_wifi() {
     ip link show wlan0 >/dev/null 2>&1 || { log "wifi: wlan0 nao apareceu"; return; }
 
     mode="$(get ORIG_WIFI_MODE)"
-    if [ -f "$SYSTEM_DIR/wifi-lib.sh" ]; then
-        # shellcheck disable=SC1091
-        . "$SYSTEM_DIR/wifi-lib.sh"
-        case "$mode" in
-            ap)     wifi_start_ap     2>/dev/null; log "  modo restaurado: AP" ;;
-            client) wifi_start_client 2>/dev/null; log "  modo restaurado: client" ;;
-            *)      log "  wlan0 carregada, modo previo era '$mode' — sem auto-start" ;;
-        esac
-    fi
+    case "$mode" in
+        ap)     wifi_start_ap     2>/dev/null; log "  modo restaurado: AP" ;;
+        client) wifi_start_client 2>/dev/null; log "  modo restaurado: client" ;;
+        *)      log "  wlan0 carregada, modo previo era '$mode' — sem auto-start" ;;
+    esac
 }
 
 restore_video() {

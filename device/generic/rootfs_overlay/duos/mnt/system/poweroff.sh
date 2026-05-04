@@ -273,14 +273,16 @@ stop_wifi() {
 
 restore_wifi() {
     if [ "$WIFI_WAS_LOADED" = 1 ] && [ -n "$SAVED_WIFI_MODE" ] && [ -f /mnt/system/ko/aic8800_bsp.ko ]; then
+        # shellcheck disable=SC1091
+        . /mnt/system/wifi-lib.sh
         insmod /mnt/system/ko/aic8800_bsp.ko 2>/dev/null
         sleep 0.5
         # custregd=0: ver duo-init.sh
         insmod /mnt/system/ko/aic8800_fdrv.ko custregd=0 2>/dev/null
         sleep 0.5
-        WIFI_COUNTRY=$(cat /mnt/data/wifi-country 2>/dev/null | tr -d '[:space:]' | tr a-z A-Z)
+        wifi_apply_mac
         iw reg reload 2>/dev/null
-        iw reg set "${WIFI_COUNTRY:-00}" 2>/dev/null
+        iw reg set "$(wifi_country)" 2>/dev/null
         i=0
         while ! ip link show wlan0 >/dev/null 2>&1 && [ $i -lt 20 ]; do
             sleep 0.5; i=$((i+1))

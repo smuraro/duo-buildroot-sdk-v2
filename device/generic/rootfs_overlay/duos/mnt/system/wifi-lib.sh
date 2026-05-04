@@ -41,6 +41,44 @@ AP_SSID_PREFIX_DEFAULT=DuoS-AP
 CLIENT_CONNECT_TIMEOUT_DEFAULT=60
 CLIENT_DISCONNECT_GRACE_DEFAULT=300
 
+# Country code regulatório. Single source of truth: lido por duo-init.sh
+# (pra `iw reg set` no kernel) e por wifi_render_hostapd_conf (pra
+# `country_code=` do hostapd). Default 00 = world domain.
+# Helper de gerência: /mnt/system/setcountry.sh (set/clear/inspect).
+WIFI_COUNTRY_FILE=/mnt/data/wifi-country
+
+wifi_country() {
+    cc=$(cat "$WIFI_COUNTRY_FILE" 2>/dev/null | tr -d '[:space:]' | tr a-z A-Z)
+    echo "${cc:-00}"
+}
+
+# MAC persistente pro wlan0. O firmware do AIC gera bytes 5-6 random
+# a cada boot (efuse interno do chip não tem MAC programado), então
+# persistimos via /mnt/data/wifi-mac e aplicamos com `ip link set`.
+# Helper de gerência: /mnt/system/setmac.sh wlan ...
+WIFI_MAC_FILE=/mnt/data/wifi-mac
+
+# Lê e normaliza pra lowercase XX:XX:XX:XX:XX:XX, ou imprime nada.
+wifi_mac() {
+    cat "$WIFI_MAC_FILE" 2>/dev/null | tr -d '[:space:]' | tr A-Z a-z
+}
+
+# Aplica o MAC persistido em wlan0. Espera até 10s pelo netdev aparecer
+# (driver SDIO é async). No-op se arquivo ausente. Idempotente —
+# trazer wlan0 down/up não causa problema mesmo se já estava up.
+wifi_apply_mac() {
+    mac=$(wifi_mac)
+    [ -z "$mac" ] && return 0
+    i=0
+    while [ ! -e /sys/class/net/wlan0 ] && [ $i -lt 20 ]; do
+        sleep 0.5; i=$((i+1))
+    done
+    [ -e /sys/class/net/wlan0 ] || return 1
+    ip link set wlan0 down 2>/dev/null
+    ip link set wlan0 address "$mac" 2>/dev/null
+    ip link set wlan0 up   2>/dev/null
+}
+
 wifi_log() {
     # 1 linha pra console + dmesg (visível no `dmesg | grep wifi`).
     echo "[wifi] $*"
@@ -84,18 +122,24 @@ wifi_render_hostapd_conf() {
     }
     suffix=$(wifi_unique_suffix)
     ssid="${AP_SSID_PREFIX}-${suffix}"
-    # Substitui (ou injeta) ssid= e, se AP_PASSPHRASE estiver setado, wpa_passphrase=.
-    awk -v ssid="$ssid" -v pass="$AP_PASSPHRASE" '
-        BEGIN { saw_ssid=0; saw_pass=0 }
+    country=$(wifi_country)
+    # Substitui (ou injeta) ssid=, country_code= e, se AP_PASSPHRASE setado,
+    # wpa_passphrase=. country_code precisa bater com o `iw reg set` do
+    # duo-init.sh — senão hostapd faz COUNTRY_UPDATE pro valor do template,
+    # sobrescrevendo o que o kernel tinha.
+    awk -v ssid="$ssid" -v pass="$AP_PASSPHRASE" -v country="$country" '
+        BEGIN { saw_ssid=0; saw_pass=0; saw_cc=0 }
         /^[[:space:]]*ssid[[:space:]]*=/        { print "ssid=" ssid; saw_ssid=1; next }
         /^[[:space:]]*wpa_passphrase[[:space:]]*=/ {
             if (pass != "") { print "wpa_passphrase=" pass } else { print }
             saw_pass=1; next
         }
+        /^[[:space:]]*country_code[[:space:]]*=/ { print "country_code=" country; saw_cc=1; next }
         { print }
         END {
             if (!saw_ssid) print "ssid=" ssid
             if (!saw_pass && pass != "") print "wpa_passphrase=" pass
+            if (!saw_cc) print "country_code=" country
         }
     ' "$HOSTAPD_TEMPLATE" > "$HOSTAPD_RUNTIME"
     wifi_log "AP SSID=$ssid (template=$HOSTAPD_TEMPLATE runtime=$HOSTAPD_RUNTIME)"
