@@ -21,8 +21,10 @@
 # REGDB
 # -----
 # As regras vêm de /lib/firmware/regulatory.db (pacote wireless-regdb,
-# assinado pela mantenedora wens). Lista de países disponíveis:
-#   strings /lib/firmware/regulatory.db | grep -E '^[A-Z]{2}$' | sort -u
+# assinado pela mantenedora wens). É um binário v20 onde cada país são
+# 2 bytes ASCII crus — `strings` (min-len 4) não extrai e usar -n 2 vira
+# lixo. Por isso este script não tenta listar/validar contra a regdb;
+# confia na sigla ISO 3166-1 alpha-2 e deixa kernel/hostapd validarem.
 #
 # USO
 # ---
@@ -38,14 +40,14 @@
 
 WIFI_COUNTRY_FILE=/mnt/data/wifi-country
 HOSTAPD_RUNTIME=/tmp/hostapd.runtime.conf
-REGDB_FILE=/lib/firmware/regulatory.db
 
 usage() {
     cat <<EOF
-Uso: $0 [COUNTRY | clear]
+Uso: $0 [COUNTRY | clear | 00]
   $0              modo interativo (recomendado)
   $0 BR           persiste o país (2 letras ISO 3166-1 alpha-2); sem reboot auto
   $0 clear        remove o arquivo (volta pra "00" / world domain)
+  $0 00           idem 'clear'
 
 País fica em $WIFI_COUNTRY_FILE. Reboot pra mudança ter efeito.
 EOF
@@ -58,17 +60,6 @@ valid_country() {
     esac
 }
 
-list_countries() {
-    if [ ! -r "$REGDB_FILE" ]; then
-        echo "  (regulatory.db não disponível em $REGDB_FILE)"
-        return 1
-    fi
-    strings "$REGDB_FILE" 2>/dev/null | grep -E '^[A-Z]{2}$' | sort -u | \
-        awk 'BEGIN { n=0 }
-             { printf "%s ", $0; n++; if (n % 16 == 0) printf "\n  " }
-             END { if (n % 16 != 0) printf "\n" }' | sed 's/^/  /'
-}
-
 show_state() {
     file_val=$(cat "$WIFI_COUNTRY_FILE" 2>/dev/null | tr -d '[:space:]' | tr a-z A-Z)
     kernel_val=$(iw reg get 2>/dev/null | awk '/^country/ {sub(/:/,"",$2); print $2; exit}')
@@ -79,22 +70,31 @@ show_state() {
     echo "  Kernel   (cfg80211):                ${kernel_val:-<indisponível>}"
     echo "  hostapd  ($HOSTAPD_RUNTIME): ${hostapd_val:-<não rodando>}"
 
-    case "$file_val:$kernel_val" in
-        :00|"":00|"":"")  echo "  → default world domain (\"00\")" ;;
-        "$kernel_val":"$kernel_val")  echo "  → coerente" ;;
-        *)  echo "  → ATENÇÃO: file e kernel divergem (algo aplicou diferente do persistido)" ;;
-    esac
+    # Diagnóstico:
+    #  - arquivo vazio + kernel vazio/00 = world domain (sem ação)
+    #  - arquivo vazio + kernel != 00    = clear pendente de reboot, NÃO é divergência
+    #  - arquivo == kernel               = coerente
+    #  - kernel vazio                    = wlan0/driver indisponível, sem como conferir
+    #  - resto                           = divergência real (kernel ficou com setting estranho)
+    if [ -z "$file_val" ]; then
+        if [ -z "$kernel_val" ] || [ "$kernel_val" = "00" ]; then
+            echo "  → world domain (\"00\") — default"
+        else
+            echo "  → arquivo vazio (default 00); kernel ainda em $kernel_val — reboot pendente"
+        fi
+    elif [ -z "$kernel_val" ]; then
+        echo "  → kernel indisponível (driver/wlan0 ausente?); arquivo persiste $file_val"
+    elif [ "$file_val" = "$kernel_val" ]; then
+        echo "  → coerente"
+    else
+        echo "  → ATENÇÃO: arquivo=$file_val, kernel=$kernel_val divergem (reboot pra reconciliar)"
+    fi
 }
 
-# Persiste o country code no arquivo. Avisa (sem bloquear) se o país
-# não está na regdb. Retorna 0 em sucesso.
+# Persiste o country code no arquivo. Não valida contra regdb (binário
+# não extraível via `strings`). Kernel/hostapd validam no boot.
 persist_country() {
     cc="$1"
-    if [ -r "$REGDB_FILE" ] && \
-       ! strings "$REGDB_FILE" 2>/dev/null | grep -qE "^${cc}\$"; then
-        echo "AVISO: '$cc' não foi encontrado em $REGDB_FILE."
-        echo "       O kernel pode rejeitar no boot."
-    fi
     mkdir -p "$(dirname "$WIFI_COUNTRY_FILE")"
     echo "$cc" > "$WIFI_COUNTRY_FILE" && sync
     echo "Persistido: $WIFI_COUNTRY_FILE = $cc"
@@ -123,8 +123,8 @@ do_reboot() {
 interactive() {
     show_state
     echo
-    echo "Países disponíveis em $REGDB_FILE:"
-    list_countries
+    echo "Códigos ISO 3166-1 alpha-2 (ex: BR, US, DE, JP, GB, FR, ES, IT, AR, CL, MX...)."
+    echo "Lista completa: https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2"
     echo
     echo "Digite:"
     echo "  - 2 letras (ex: BR, US, DE)         → persiste"
@@ -138,7 +138,7 @@ interactive() {
         "")
             echo "Cancelado, nenhuma mudança."
             exit 0 ;;
-        clear|CLEAR)
+        clear|CLEAR|00)
             clear_country ;;
         *)
             cc=$(printf '%s' "$ans" | tr a-z A-Z)
@@ -170,7 +170,7 @@ case "$1" in
   "")
     interactive; exit 0 ;;
 
-  clear)
+  clear|00)
     clear_country; exit 0 ;;
 esac
 

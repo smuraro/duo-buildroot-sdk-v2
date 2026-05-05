@@ -209,7 +209,7 @@ wifi_start_ap() {
     wifi_stop_client
     wifi_stop_ap
     wifi_render_hostapd_conf || return 1
-    iw reg set BR 2>/dev/null
+    iw reg set "$(wifi_country)" 2>/dev/null
     ifconfig $WIFI_IFACE $AP_IP netmask $AP_NETMASK up || return 1
     hostapd -B -P "$HOSTAPD_PIDFILE" "$HOSTAPD_RUNTIME" || {
         wifi_log "ERRO: hostapd falhou ao iniciar"
@@ -254,7 +254,7 @@ wifi_start_client() {
         return 1
     }
     wifi_stop_ap
-    iw reg set BR 2>/dev/null
+    iw reg set "$(wifi_country)" 2>/dev/null
     ip addr flush dev $WIFI_IFACE 2>/dev/null
     ifconfig $WIFI_IFACE up || return 1
     wpa_supplicant -B -i $WIFI_IFACE -c "$WPA_SUPPLICANT_CONF" \
