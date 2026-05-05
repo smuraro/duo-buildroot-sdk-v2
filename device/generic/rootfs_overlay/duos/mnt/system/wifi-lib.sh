@@ -34,10 +34,15 @@ WATCHDOG_PIDFILE=/var/run/wifi-watchdog.pid
 # Overrides opcionais em /mnt/data/wifi.conf (key=value):
 #   AP_SSID_PREFIX=MeuDuo
 #   AP_PASSPHRASE=segredo123
+#   AP_BAND=2g                  # ou 5g
+#   AP_CHANNEL=6                # canal default depende da banda
 #   CLIENT_CONNECT_TIMEOUT=60
 #   CLIENT_DISCONNECT_GRACE=300
 WIFI_OVERRIDES=/mnt/data/wifi.conf
 AP_SSID_PREFIX_DEFAULT=DuoS-AP
+AP_BAND_DEFAULT=2g
+AP_CHANNEL_2G_DEFAULT=6
+AP_CHANNEL_5G_DEFAULT=36
 CLIENT_CONNECT_TIMEOUT_DEFAULT=60
 CLIENT_DISCONNECT_GRACE_DEFAULT=300
 
@@ -88,6 +93,8 @@ wifi_log() {
 wifi_load_overrides() {
     AP_SSID_PREFIX="$AP_SSID_PREFIX_DEFAULT"
     AP_PASSPHRASE=""
+    AP_BAND="$AP_BAND_DEFAULT"
+    AP_CHANNEL=""
     CLIENT_CONNECT_TIMEOUT="$CLIENT_CONNECT_TIMEOUT_DEFAULT"
     CLIENT_DISCONNECT_GRACE="$CLIENT_DISCONNECT_GRACE_DEFAULT"
     if [ -f "$WIFI_OVERRIDES" ]; then
@@ -95,11 +102,43 @@ wifi_load_overrides() {
         while IFS= read -r line; do
             case "$line" in
                 ''|\#*) ;;
-                AP_SSID_PREFIX=*|AP_PASSPHRASE=*|CLIENT_CONNECT_TIMEOUT=*|CLIENT_DISCONNECT_GRACE=*)
+                AP_SSID_PREFIX=*|AP_PASSPHRASE=*|AP_BAND=*|AP_CHANNEL=*|CLIENT_CONNECT_TIMEOUT=*|CLIENT_DISCONNECT_GRACE=*)
                     eval "$line" ;;
             esac
         done < "$WIFI_OVERRIDES"
     fi
+    # Runtime overrides (CLI wifi-ap exporta AP_*_OVERRIDE pra forçar valores
+    # acima do que está no arquivo, sem precisar editar /mnt/data/wifi.conf).
+    [ -n "$AP_BAND_OVERRIDE" ]    && AP_BAND="$AP_BAND_OVERRIDE"
+    [ -n "$AP_CHANNEL_OVERRIDE" ] && AP_CHANNEL="$AP_CHANNEL_OVERRIDE"
+    # Normaliza banda e resolve canal default por banda.
+    case "$AP_BAND" in
+        2g|2.4g|2G|2.4G) AP_BAND=2g ;;
+        5g|5G)           AP_BAND=5g ;;
+        *)               AP_BAND=2g ;;
+    esac
+    if [ -z "$AP_CHANNEL" ]; then
+        case "$AP_BAND" in
+            5g) AP_CHANNEL="$AP_CHANNEL_5G_DEFAULT" ;;
+            *)  AP_CHANNEL="$AP_CHANNEL_2G_DEFAULT" ;;
+        esac
+    fi
+}
+
+# Canal está em range não-DFS pra banda dada? Canais DFS no 5GHz (52-144)
+# exigem ieee80211h=1 e CAC ~60s antes do AP subir — caro pra UX.
+wifi_channel_is_dfs() {
+    band="$1"; ch="$2"
+    [ "$band" = "5g" ] || return 1
+    [ "$ch" -ge 52 ] && [ "$ch" -le 144 ] 2>/dev/null
+}
+
+# Map banda → hw_mode hostapd. ieee80211n=1 (já no template) cobre HT em ambas.
+wifi_hw_mode() {
+    case "$1" in
+        5g) echo a ;;
+        *)  echo g ;;
+    esac
 }
 
 # Sufixo único de 6 hex (3 últimos octetos do MAC do wlan0).
@@ -128,13 +167,27 @@ wifi_render_hostapd_conf() {
     # hostapd não força COUNTRY_UPDATE e respeita o que o kernel tem.
     [ "$country" = "00" ] && country=""
 
-    # Substitui ssid=, country_code= (se houver country) e, se
-    # AP_PASSPHRASE setado, wpa_passphrase=. country_code definido
-    # precisa bater com o `iw reg set` do duo-init.sh, senão hostapd
-    # sobrescreve o que o kernel tinha via COUNTRY_UPDATE.
-    awk -v ssid="$ssid" -v pass="$AP_PASSPHRASE" -v country="$country" '
-        BEGIN { saw_ssid=0; saw_pass=0; saw_cc=0 }
+    hw_mode=$(wifi_hw_mode "$AP_BAND")
+    # ieee80211d só faz sentido quando há country_code (kernel valida regras
+    # por país); ieee80211h é exigido pelo hostapd quando o canal é DFS.
+    ieee80211d=0; ieee80211h=0
+    [ -n "$country" ] && ieee80211d=1
+    wifi_channel_is_dfs "$AP_BAND" "$AP_CHANNEL" && ieee80211h=1
+
+    # Substitui ssid=, hw_mode=, channel=, country_code= (se houver country),
+    # ieee80211d=, ieee80211h= e wpa_passphrase= (se AP_PASSPHRASE). Linhas
+    # ausentes no template são adicionadas no END. country_code definido
+    # precisa bater com o `iw reg set` do duo-init.sh — senão hostapd
+    # sobrescreve o kernel via COUNTRY_UPDATE.
+    awk -v ssid="$ssid" -v pass="$AP_PASSPHRASE" -v country="$country" \
+        -v hw_mode="$hw_mode" -v chan="$AP_CHANNEL" \
+        -v d11d="$ieee80211d" -v d11h="$ieee80211h" '
+        BEGIN { saw_ssid=0; saw_pass=0; saw_cc=0; saw_hw=0; saw_ch=0; saw_d=0; saw_h=0 }
         /^[[:space:]]*ssid[[:space:]]*=/        { print "ssid=" ssid; saw_ssid=1; next }
+        /^[[:space:]]*hw_mode[[:space:]]*=/     { print "hw_mode=" hw_mode; saw_hw=1; next }
+        /^[[:space:]]*channel[[:space:]]*=/     { print "channel=" chan; saw_ch=1; next }
+        /^[[:space:]]*ieee80211d[[:space:]]*=/  { print "ieee80211d=" d11d; saw_d=1; next }
+        /^[[:space:]]*ieee80211h[[:space:]]*=/  { print "ieee80211h=" d11h; saw_h=1; next }
         /^[[:space:]]*wpa_passphrase[[:space:]]*=/ {
             if (pass != "") { print "wpa_passphrase=" pass } else { print }
             saw_pass=1; next
@@ -146,11 +199,15 @@ wifi_render_hostapd_conf() {
         { print }
         END {
             if (!saw_ssid) print "ssid=" ssid
+            if (!saw_hw)   print "hw_mode=" hw_mode
+            if (!saw_ch)   print "channel=" chan
+            if (!saw_d)    print "ieee80211d=" d11d
+            if (!saw_h)    print "ieee80211h=" d11h
             if (!saw_pass && pass != "") print "wpa_passphrase=" pass
             if (!saw_cc && country != "") print "country_code=" country
         }
     ' "$HOSTAPD_TEMPLATE" > "$HOSTAPD_RUNTIME"
-    wifi_log "AP SSID=$ssid (template=$HOSTAPD_TEMPLATE runtime=$HOSTAPD_RUNTIME)"
+    wifi_log "AP SSID=$ssid band=$AP_BAND ch=$AP_CHANNEL country=${country:-00} (runtime=$HOSTAPD_RUNTIME)"
 }
 
 # Mata um daemon pelo seu pidfile, com graceful + force.
@@ -206,6 +263,19 @@ wifi_start_ap() {
         wifi_log "ERRO: $WIFI_IFACE ausente; modulo aic8800 carregado?"
         return 1
     }
+    wifi_load_overrides
+    # 5GHz exige country code real: world domain (00) marca todas as faixas
+    # 5G como NO-IR / PASSIVE-SCAN, então hostapd até inicia mas o driver
+    # bloqueia transmissão. No boot (AP_BAND=5g em wifi.conf sem country),
+    # cair pra 2.4GHz com warning e seguir — pior que ignorar a preferencia
+    # do usuario seria ficar sem AP. CLI 'wifi-ap 5g' já trata isso antes,
+    # entao essa proteção é só do caminho de boot/automatico.
+    if [ "$AP_BAND" = "5g" ] && [ "$(wifi_country)" = "00" ]; then
+        wifi_log "AVISO: AP_BAND=5g sem country code; caindo pra 2.4GHz."
+        wifi_log "       Rode 'wifi-ap 5g <BR|US|...>' ou '/mnt/system/setcountry.sh BR'."
+        AP_BAND=2g
+        AP_CHANNEL="$AP_CHANNEL_2G_DEFAULT"
+    fi
     wifi_stop_client
     wifi_stop_ap
     wifi_render_hostapd_conf || return 1

@@ -17,6 +17,15 @@ case "$mode" in
     ap)
         echo "AP SSID   : ${AP_SSID_PREFIX}-${suffix}"
         echo "AP IP     : $AP_IP"
+        # Banda/canal vem do hostapd ao vivo (mais autoritativo que o
+        # runtime.conf, que pode estar stale se o AP foi reconfigurado).
+        ap_status=$(hostapd_cli -p /var/run/hostapd -i $WIFI_IFACE status 2>/dev/null)
+        ap_freq=$(echo "$ap_status" | awk -F= '$1=="freq"{print $2; exit}')
+        ap_chan=$(echo "$ap_status" | awk -F= '$1=="channel"{print $2; exit}')
+        ap_state=$(echo "$ap_status" | awk -F= '$1=="state"{print $2; exit}')
+        ap_band=2.4GHz
+        [ -n "$ap_freq" ] && [ "$ap_freq" -ge 5000 ] 2>/dev/null && ap_band=5GHz
+        echo "AP band   : $ap_band  (canal $ap_chan, ${ap_freq:-?} MHz, state=${ap_state:-?})"
         if [ -f "$HOSTAPD_PIDFILE" ] && kill -0 "$(cat $HOSTAPD_PIDFILE)" 2>/dev/null; then
             echo "hostapd   : running (pid $(cat $HOSTAPD_PIDFILE))"
         else

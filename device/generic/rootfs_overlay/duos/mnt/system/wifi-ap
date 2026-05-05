@@ -1,10 +1,97 @@
 #!/bin/sh
 # Alterna o Wi-Fi para modo AP imediatamente (mata client/watchdog se ativos).
-# Não persiste preferência: se /mnt/data/wpa_supplicant.conf existir, no
-# próximo boot o sistema vai tentar Client de novo. Use `wifi-client -d`
-# para remover essa config persistente.
+#
+# Uso:
+#   wifi-ap                 # banda/canal de /mnt/data/wifi.conf ou default (2.4GHz ch 6)
+#   wifi-ap 2g [canal]      # 2.4GHz; canal 1-13 (default 6)
+#   wifi-ap 5g [canal] [CC] # 5GHz; canal default 36; pergunta country se nao setado
+#   wifi-ap 5g BR           # 5GHz default ch36, country BR (atalho)
+#
+# Em 5GHz o country code e obrigatorio (world domain '00' bloqueia 5G via NO-IR).
+# Se nao for passado e o tty estiver disponivel, pergunta interativamente
+# com default BR. Sem tty (script), aborta com mensagem acionavel.
+#
+# Persiste o country em /mnt/data/wifi-country (mesma fonte do setcountry.sh).
+# Nao persiste banda/canal — pra isso edite /mnt/data/wifi.conf:
+#   AP_BAND=5g
+#   AP_CHANNEL=149
 
 . /mnt/system/wifi-lib.sh
+
+DEFAULT_COUNTRY=BR
+
+usage() {
+    cat <<EOF
+Uso: $0 [BAND [CHANNEL]] [COUNTRY]
+  $0                 # banda/canal default (2.4GHz ch 6)
+  $0 2g [ch]         # 2.4GHz; ch 1-13 (default 6)
+  $0 5g [ch] [CC]    # 5GHz; ch default 36 (UNII-1); CC obrigatorio
+  $0 5g CC           # atalho: 5GHz ch36 com country CC
+EOF
+}
+
+# Parse args order-agnostic apos a banda: aceita BAND [CH] [CC] em qualquer
+# ordem entre CH/CC. Banda e sempre o primeiro arg (se houver).
+band=""; ch=""; cc=""
+case "$1" in
+    -h|--help) usage; exit 0 ;;
+    "")              ;;
+    2g|2.4g|2G|2.4G) band=2g; shift ;;
+    5g|5G)           band=5g; shift ;;
+    *) echo "ERRO: banda invalida '$1' (use 2g ou 5g)" >&2; usage >&2; exit 1 ;;
+esac
+
+while [ -n "$1" ]; do
+    case "$1" in
+        [0-9]*)
+            [ -n "$ch" ] && { echo "ERRO: canal duplicado ('$ch' e '$1')" >&2; exit 1; }
+            ch="$1" ;;
+        [A-Za-z][A-Za-z])
+            [ -n "$cc" ] && { echo "ERRO: country duplicado ('$cc' e '$1')" >&2; exit 1; }
+            cc=$(printf '%s' "$1" | tr a-z A-Z) ;;
+        *) echo "ERRO: argumento invalido '$1' (esperado canal ou country 2-letras)" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# 5GHz precisa de country. Se nao veio na CLI nem em /mnt/data/wifi-country,
+# pergunta interativamente (default BR) ou aborta se sem tty.
+if [ "$band" = "5g" ] && [ -z "$cc" ]; then
+    current=$(wifi_country)
+    if [ "$current" != "00" ]; then
+        cc="$current"   # ja persistido, nao precisa perguntar
+    elif [ -t 0 ]; then
+        echo "[wifi-ap] AP em 5GHz exige country code (world domain bloqueia 5G)."
+        printf "Country code [%s]: " "$DEFAULT_COUNTRY"
+        read -r ans
+        cc=$(printf '%s' "$ans" | tr a-z A-Z)
+        [ -z "$cc" ] && cc="$DEFAULT_COUNTRY"
+        case "$cc" in
+            [A-Z][A-Z]) ;;
+            *) echo "ERRO: '$ans' invalido (2 letras, ex: BR, US, DE)" >&2; exit 1 ;;
+        esac
+        echo "[wifi-ap] usando country=$cc (use setcountry.sh pra mudar)"
+    else
+        echo "ERRO: 5GHz sem country e sem tty. Use 'wifi-ap 5g $DEFAULT_COUNTRY' ou setcountry.sh." >&2
+        exit 1
+    fi
+fi
+
+# Se a CLI passou country (explicito ou via prompt), persiste e aplica.
+# Idempotente: nao reescreve se ja for o mesmo valor.
+if [ -n "$cc" ]; then
+    cur=$(wifi_country)
+    if [ "$cc" != "$cur" ]; then
+        mkdir -p "$(dirname "$WIFI_COUNTRY_FILE")"
+        echo "$cc" > "$WIFI_COUNTRY_FILE" && sync
+        echo "[wifi-ap] country persistido em $WIFI_COUNTRY_FILE = $cc"
+    fi
+    iw reg set "$cc" 2>/dev/null
+fi
+
+# Exporta overrides pra wifi_load_overrides pegar.
+[ -n "$band" ] && export AP_BAND_OVERRIDE="$band"
+[ -n "$ch" ]   && export AP_CHANNEL_OVERRIDE="$ch"
 
 wifi_stop_watchdog
 wifi_stop_client
@@ -12,7 +99,7 @@ wifi_stop_client
 if wifi_start_ap; then
     suffix=$(wifi_unique_suffix)
     wifi_load_overrides
-    echo "[wifi-ap] AP ativo  SSID=${AP_SSID_PREFIX}-${suffix}  IP=$AP_IP"
+    echo "[wifi-ap] AP ativo  SSID=${AP_SSID_PREFIX}-${suffix}  band=$AP_BAND  ch=$AP_CHANNEL  IP=$AP_IP"
     exit 0
 fi
 echo "[wifi-ap] FALHOU ao iniciar AP — ver dmesg/journalctl" >&2
