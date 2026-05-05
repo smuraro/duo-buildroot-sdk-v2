@@ -1,0 +1,132 @@
+#!/bin/sh
+#
+# S01firstboot - One-shot setup do primeiro boot da imagem flashada.
+#
+# Sentinel /root/.firstboot_done garante que roda exatamente uma vez na
+# vida da rootfs. Boots subsequentes encontram o flag e fazem exit cedo.
+#
+# Estagios (ordem importa):
+#   1) Expande a particao rootfs e o filesystem ate preencher o storage.
+#      Funciona pra todas as variantes do Duo (SD e eMMC) detectando o
+#      device root via /proc/self/mountinfo (sem hardcode de partition #):
+#        Duo S  SD   : BOOT(p1) + MISC(p2)  + ROOTFS(p3)            -> mmcblk0p3
+#        Duo S  eMMC : BOOT(p1) + MISC(p2)  + ENV(p3)  + ROOTFS(p4) -> mmcblk0p4
+#        Duo256m SD  : BOOT(p1) + ROOTFS(p2)                         -> mmcblk0p2
+#        Duo    SD   : BOOT(p1) + ROOTFS(p2)                         -> mmcblk0p2
+#
+#   2) Desabilita a stack node-red/sscma renomeando S03/S91/S93 -> K*.
+#      Reativar persistente em runtime: /root/node-red-services.sh start
+#      O proprio rcS pula entradas K* pelo `[ ! -f "$i" ] && continue`
+#      apos o glob expandido — entao o disable feito aqui (S01) ja afeta
+#      esse mesmo boot, sem precisar reiniciar.
+#
+# Migration: imagens anteriores marcavam apenas /root/.resize_done. Se
+# encontrarmos esse arquivo legado sem o sentinel novo, promovemos a
+# .firstboot_done e saimos — assim um upgrade que preserve /root nao
+# desabilita a stack que o usuario ja tinha ativado.
+#
+
+DONE_FLAG="/root/.firstboot_done"
+LEGACY_RESIZE_FLAG="/root/.resize_done"
+INITD="/etc/init.d"
+DISABLE_SERVICES="03node-red 91sscma-node 93sscma-supervisor"
+
+stage_resize() {
+    # Resolve the real block device for the root filesystem.
+    # /proc/mounts often shows "/dev/root" (a kernel alias) instead of the
+    # real device. Use /proc/self/mountinfo which provides the actual
+    # major:minor numbers, then look up the device name in /sys/dev/block/.
+    #
+    # /proc/self/mountinfo field 3 is "maj:min", field 5 is mountpoint.
+    MAJ_MIN=$(awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
+    if [ -z "$MAJ_MIN" ]; then
+      echo "S01firstboot: cannot read mountinfo, skipping resize." >&2
+      return 1
+    fi
+
+    DEVNAME=$(grep DEVNAME /sys/dev/block/${MAJ_MIN}/uevent 2>/dev/null | cut -d= -f2)
+    if [ -z "$DEVNAME" ]; then
+      echo "S01firstboot: cannot resolve device for $MAJ_MIN, skipping resize." >&2
+      return 1
+    fi
+    ROOT_DEV="/dev/$DEVNAME"
+
+    # Derive disk and partition number
+    # e.g. /dev/mmcblk0p3 -> DISK=/dev/mmcblk0, PART_NUM=3
+    DISK=$(echo "$ROOT_DEV" | sed 's/p[0-9]*$//')
+    PART_NUM=$(echo "$ROOT_DEV" | grep -o '[0-9]*$')
+
+    echo "S01firstboot: expanding $ROOT_DEV (disk=$DISK part=$PART_NUM) ..."
+
+    # eMMC has hardware boot partitions (/dev/mmcblk0boot0); SD does not.
+    # For eMMC the rootfs partition already fills the chip, so only the
+    # filesystem needs expanding (parted can't read the proprietary CVI
+    # partition table on eMMC and is not needed there).
+    # For SD the card may be larger than the image, so we expand the
+    # partition first, then the filesystem.
+    if [ -b "${DISK}boot0" ]; then
+      echo "S01firstboot: eMMC detected, resizing filesystem only..."
+    else
+      echo "S01firstboot: SD detected, resizing partition then filesystem..."
+      parted -s "$DISK" resizepart "$PART_NUM" 100%
+      if [ $? -ne 0 ]; then
+        echo "S01firstboot: parted resizepart failed, aborting." >&2
+        return 1
+      fi
+      # Notify kernel of updated partition table and wait for it to settle
+      partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null
+      sleep 1
+    fi
+
+    # Extend the ext4 filesystem to fill the (possibly expanded) partition
+    resize2fs "$ROOT_DEV"
+    if [ $? -ne 0 ]; then
+      echo "S01firstboot: resize2fs failed." >&2
+      return 1
+    fi
+
+    echo "S01firstboot: resize done."
+    return 0
+}
+
+stage_disable_recamera_stack() {
+    echo "S01firstboot: disabling node-red/sscma stack (use node-red-services.sh start to enable)..."
+    for svc in $DISABLE_SERVICES; do
+        if [ -f "$INITD/S$svc" ]; then
+            mv -f "$INITD/S$svc" "$INITD/K$svc"
+        fi
+    done
+}
+
+case "$1" in
+  start)
+    # Migration: imagem antiga marcava .resize_done apenas. Se aparecer
+    # sem .firstboot_done, promove e sai (preserva estado pos-upgrade).
+    if [ ! -f "$DONE_FLAG" ] && [ -f "$LEGACY_RESIZE_FLAG" ]; then
+        echo "S01firstboot: legacy .resize_done detected; marking firstboot done."
+        touch "$DONE_FLAG"
+        exit 0
+    fi
+
+    [ -f "$DONE_FLAG" ] && exit 0
+
+    stage_resize
+    stage_disable_recamera_stack
+
+    touch "$DONE_FLAG"
+    ;;
+
+  stop)
+    ;;
+
+  restart|reload)
+    "$0" start
+    ;;
+
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+
+exit 0
