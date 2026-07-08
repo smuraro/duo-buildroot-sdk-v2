@@ -30,6 +30,7 @@
 
 UID_FILE=/sys/class/cvi-base/base_uid
 WIFI_MAC_FILE=/mnt/data/wifi-mac
+WIFI1_MAC_FILE=/mnt/data/wifi1-mac   # MAC fixo para wlan1 (WiFi Station)
 
 usage() {
     cat <<EOF
@@ -37,9 +38,11 @@ Uso: $0 [eth|wlan|all] [MAC] | clear [eth|wlan|all] | -h
   $0                       modo interativo
   $0 eth                   deriva eth0 do UID, prefixo 02
   $0 wlan                  deriva wlan0 do UID, prefixo 06
+  $0 wlan1                 deriva wlan1 STATION do UID, prefixo 0a
   $0 all                   deriva ambos (eth=02:..., wlan=06:...)
   $0 eth  AA:BB:..:FF      seta eth0 manualmente
   $0 wlan AA:BB:..:FF      seta wlan0 manualmente
+  $0 wlan1 AA:BB:..:FF     seta wlan1 STATION manualmente
   $0 clear all             remove ambos
   $0 clear eth             remove só eth0
   $0 clear wlan            remove só wlan0
@@ -47,6 +50,7 @@ Uso: $0 [eth|wlan|all] [MAC] | clear [eth|wlan|all] | -h
 Persistência:
   eth0  -> ethaddr no env do U-Boot (mmcblk0p3)
   wlan0 -> $WIFI_MAC_FILE (aplicado por duo-init.sh)
+  wlan1 -> $WIFI1_MAC_FILE (aplicado por S99zwifista)
 
 Mudanças valem só após reboot.
 EOF
@@ -61,7 +65,7 @@ valid_mac() {
 }
 
 # Lê os 10 hex chars finais do UID do chip. Falha se driver cvi-base
-# não estiver carregado (sobe em S99user — final do boot).
+# não estiver carregado (sobe em S99user  final do boot).
 read_uid_suffix() {
     if [ ! -r "$UID_FILE" ]; then
         echo "ERRO: $UID_FILE indisponível (driver cvi-base sobe em S99user)." >&2
@@ -76,7 +80,7 @@ read_uid_suffix() {
 }
 
 # Monta MAC <prefix>:XX:XX:XX:XX:XX a partir dos 10 hex chars finais
-# do UID. Prefix recomendado: 02 (eth) ou 06 (wlan) — locally-administered.
+# do UID. Prefix recomendado: 02 (eth) ou 06 (wlan)  locally-administered.
 derive_mac() {
     prefix="$1"
     sfx=$(read_uid_suffix) || return 1
@@ -133,6 +137,41 @@ clear_wlan() {
     fi
 }
 
+
+# ----- WLAN1 (WiFi Station) -----
+# O wlan1 tambem sobe com MAC random, o que faz o IP mudar a cada boot
+# (o router ve um "novo" dispositivo), quebra a cache ARP e impede reserva
+# de IP fixa. Guardamos um MAC fixo aqui; e' aplicado pelo S99zwifista
+# (ip link set wlan1 address) ANTES de o wlan1 associar.
+
+set_wlan1() {
+    mac=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+    if ! valid_mac "$mac"; then
+        echo "ERRO: '$1' nao e' MAC valido" >&2
+        return 1
+    fi
+    echo "wlan1: persistindo MAC=$mac em $WIFI1_MAC_FILE..."
+    mkdir -p "$(dirname "$WIFI1_MAC_FILE")"
+    echo "$mac" > "$WIFI1_MAC_FILE" && sync
+    # aplica ja tambem em runtime (se a interface existir)
+    if [ -d /sys/class/net/wlan1 ]; then
+        ip link set wlan1 down 2>/dev/null
+        ip link set wlan1 address "$mac" 2>/dev/null && echo "  aplicado agora em wlan1."
+        ip link set wlan1 up 2>/dev/null
+    fi
+    cat "$WIFI1_MAC_FILE"
+}
+
+clear_wlan1() {
+    if [ -f "$WIFI1_MAC_FILE" ]; then
+        rm -f "$WIFI1_MAC_FILE" && sync
+        echo "wlan1: removido $WIFI1_MAC_FILE."
+        echo "  Reboot pra wlan1 voltar a MAC random."
+    else
+        echo "wlan1: $WIFI1_MAC_FILE ja nao existia."
+    fi
+}
+
 # ----- INTERATIVO -----
 
 show_state() {
@@ -140,12 +179,16 @@ show_state() {
     eth_now=$(cat /sys/class/net/eth0/address 2>/dev/null)
     wlan_file=$(cat "$WIFI_MAC_FILE" 2>/dev/null | tr -d '[:space:]')
     wlan_now=$(cat /sys/class/net/wlan0/address 2>/dev/null)
+    wlan1_file=$(cat "$WIFI1_MAC_FILE" 2>/dev/null | tr -d '[:space:]')
+    wlan1_now=$(cat /sys/class/net/wlan1/address 2>/dev/null)
 
     echo "Estado atual:"
     echo "  eth0  ethaddr (U-Boot env): ${eth_env:-<vazio = random>}"
     echo "  eth0  current /sys:         ${eth_now:-<down>}"
     echo "  wlan0 file ($WIFI_MAC_FILE): ${wlan_file:-<vazio = random>}"
     echo "  wlan0 current /sys:          ${wlan_now:-<down>}"
+    echo "  wlan1 file ($WIFI1_MAC_FILE): ${wlan1_file:-<vazio = random>}"
+    echo "  wlan1 current /sys:          ${wlan1_now:-<down>}"
 }
 
 interactive() {
@@ -154,12 +197,15 @@ interactive() {
     echo "O que fazer?"
     echo "  1) derivar e setar AMBOS (eth=02:..., wlan=06:..., do UID do chip)"
     echo "  2) só eth (deriva do UID)"
-    echo "  3) só wlan (deriva do UID)"
+    echo "  3) só wlan0 (deriva do UID)"
+    echo "  3b) só wlan1 STATION (deriva do UID, prefixo 0a)"
     echo "  4) eth manual (informa MAC)"
-    echo "  5) wlan manual (informa MAC)"
+    echo "  5) wlan0 manual (informa MAC)"
+    echo "  5b) wlan1 STATION manual (informa MAC)"
     echo "  6) clear ambos"
     echo "  7) clear eth"
-    echo "  8) clear wlan"
+    echo "  8) clear wlan0"
+    echo "  8b) clear wlan1"
     echo "  Enter = cancela"
     echo
     printf "Opção: "
@@ -180,6 +226,10 @@ interactive() {
             mac_wlan=$(derive_mac 06) || exit 1
             set_wlan "$mac_wlan"
             ;;
+        3b|3B)
+            mac_wlan1=$(derive_mac 0a) || exit 1
+            set_wlan1 "$mac_wlan1"
+            ;;
         4)
             printf "MAC pra eth0 (XX:XX:XX:XX:XX:XX): "
             read -r m
@@ -188,9 +238,14 @@ interactive() {
             printf "MAC pra wlan0 (XX:XX:XX:XX:XX:XX): "
             read -r m
             set_wlan "$m" ;;
+        5b|5B)
+            printf "MAC pra wlan1 STATION (XX:XX:XX:XX:XX:XX): "
+            read -r m
+            set_wlan1 "$m" ;;
         6)  clear_eth; clear_wlan ;;
         7)  clear_eth ;;
         8)  clear_wlan ;;
+        8b|8B) clear_wlan1 ;;
         *)  echo "Opção inválida."; exit 1 ;;
     esac
 
@@ -223,6 +278,7 @@ case "$1" in
     case "$2" in
         eth)         clear_eth ;;
         wlan)        clear_wlan ;;
+        wlan1)       clear_wlan1 ;;
         all|"")      clear_eth; clear_wlan ;;
         *) echo "ERRO: 'clear $2' inválido. Use clear [eth|wlan|all]" >&2; exit 1 ;;
     esac
@@ -247,6 +303,16 @@ case "$1" in
         set_wlan "$m" || exit 1
     fi
     echo; echo "Reboot pra aplicar."
+    exit 0 ;;
+
+  wlan1)
+    if [ -n "$2" ]; then
+        set_wlan1 "$2" || exit 1
+    else
+        m=$(derive_mac 0a) || exit 1
+        set_wlan1 "$m" || exit 1
+    fi
+    echo; echo "Reboot pra aplicar (ou ja aplicado em runtime)."
     exit 0 ;;
 
   all)
